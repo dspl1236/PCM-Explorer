@@ -106,6 +106,15 @@ def hexdump(data, base_off=0, width=16):
     return "\n".join(out)
 
 
+def safe_name(s):
+    """Filenames off a damaged or foreign drive can hold arbitrary bytes.
+
+    Replace anything unprintable so a listing can't mangle the terminal or blow
+    up on a console codepage that cannot represent it.
+    """
+    return "".join(c if 32 <= ord(c) < 127 else "?" for c in s)
+
+
 def mode_str(mode):
     kind = {S_IFREG: "-", S_IFDIR: "d", S_IFLNK: "l",
             0x2000: "c", 0x6000: "b", 0x1000: "p"}.get(mode & S_IFMT, "?")
@@ -271,6 +280,11 @@ class DiskImage:
             })
         return sorted(out, key=lambda s: -s["serial"])
 
+    def is_qnx4(self, p):
+        """QNX4 has no superblock -- the root inode sits at block 1, named '/'."""
+        d = self.read(p["base"] + QNX4_BS, QNX4_ENTRY)   # block 2, 1-based
+        return len(d) == QNX4_ENTRY and d[0:16].split(b"\x00")[0] == b"/"
+
     def detect_fs(self, p):
         """Returns (label, detail)."""
         sbs = self.superblocks(p)
@@ -280,19 +294,27 @@ class DiskImage:
                             % (s["blocksize"], s["num_inodes"] - s["free_inodes"],
                                s["num_inodes"], s["num_blocks"], s["free_blocks"],
                                s["allocgroup"]))
+        if self.is_qnx4(p):
+            root = self.read(p["base"] + QNX4_BS, QNX4_ENTRY)
+            return "QNX4", "root at block %d, %d blocks" % (
+                _u32(root, 0x14), _u32(root, 0x18))
         head = self.read(p["base"], 8192)
         if QNX4_MAGIC in head:
-            return "QNX4", "QNX4 signature (not yet browsable)"
+            return "QNX4", "QNX4 signature"
         if head[3:11] == b"NTFS    ":
             return "NTFS", ""
         if b"FAT32" in head[:100] or b"FAT16" in head[:100]:
             return "FAT", ""
-        return "unknown", "no QNX6 superblock (salvage scan may still work)"
+        return "unknown", "no recognised filesystem (salvage scan may still work)"
 
     def open_fs(self, p):
-        """Return a QNX6FS for this partition, or None if it isn't QNX6."""
+        """Open the partition's filesystem (QNX6 or QNX4), or None."""
         try:
             return QNX6FS(self, p)
+        except ValueError:
+            pass
+        try:
+            return QNX4FS(self, p)
         except ValueError:
             return None
 
@@ -353,6 +375,8 @@ class DiskImage:
 # ------------------------------------------------------------------- QNX6FS --
 class QNX6FS:
     """A mounted QNX6 filesystem: inodes, files, directories, symlinks."""
+
+    kind = "QNX6"
 
     def __init__(self, img, part, cache_blocks=512):
         self.img = img
@@ -588,6 +612,222 @@ class QNX6FS:
                         bad += 1
         res.append(("directory identity", bad == 0,
                     "%d directories checked, %d inconsistent" % (checked, bad)))
+        return res
+
+
+# -------------------------------------------------------------------- QNX4 --
+# Older Harman drives (and the nav partition on every PCM 3.1 drive) use QNX4
+# rather than QNX6. It is a much simpler format: 512-byte blocks, and a 64-byte
+# directory entry that carries the inode inline -- name, size and extents all in
+# the one record. There is no superblock; the root directory's inode sits at
+# block 1 with the name "/".
+QNX4_BS = 512
+QNX4_NAME = 16          # inline name length in a directory entry
+QNX4_LINK_NAME = 48     # name length in a link entry (how QNX4 does long names)
+QNX4_ENTRY = 64
+
+QNX4_FILE_USED = 0x01
+QNX4_FILE_MODIFIED = 0x02
+QNX4_FILE_BUSY = 0x04
+QNX4_FILE_LINK = 0x08
+QNX4_FILE_INODE = 0x10
+# Only the low five bits are defined. A directory's extent usually runs past its
+# last real entry into unallocated space, and that tail is full of stale file
+# data whose "status" byte often has bit 0 set by chance -- so requiring the high
+# bits to be clear is what separates real entries from noise.
+QNX4_STATUS_MASK = 0xE0
+
+_QNX4_XBLK_SIG = b"IamXblk"
+
+
+class QNX4FS:
+    """A QNX4 filesystem. Mirrors the QNX6FS interface so callers don't branch."""
+
+    kind = "QNX4"
+
+    def __init__(self, img, part):
+        self.img = img
+        self.part = part
+        self.base = part["base"]
+        self.plen = part["length"]
+        self.bs = QNX4_BS
+        root = self._entry_at(self.boff(2), 0)
+        if root is None or root["name"] != "/":
+            raise ValueError("%s: no QNX4 root inode" % part["name"])
+        root["path"] = "/"
+        root["ino"] = QNX4_BS  # synthetic, stable: block*64 + index
+        self.root = root
+
+    # -- geometry --
+    def boff(self, b):
+        """QNX4 block numbers are 1-BASED: block 1 is the first block.
+
+        Getting this wrong is quietly destructive rather than obviously broken --
+        directory listings still look plausible because they simply lose their
+        first block and gain a block of unallocated noise, and extracted files
+        come out shifted by 512 bytes.
+        """
+        return self.base + (b - 1) * QNX4_BS
+
+    # -- entries --
+    def _entry_at(self, off, idx, require_name=True):
+        d = self.img.read(off + idx * QNX4_ENTRY, QNX4_ENTRY)
+        if len(d) < QNX4_ENTRY:
+            return None
+        return self._parse_entry(d, off, idx, require_name)
+
+    def _parse_entry(self, d, off, idx, require_name=True):
+        status = d[0x3F]
+        if status & QNX4_FILE_LINK:
+            # A link entry: it carries the long name, and the real inode lives
+            # elsewhere on the disk. That target inode has no inline name of its
+            # own -- the name only exists here -- so don't demand one from it.
+            name = d[0:QNX4_LINK_NAME].split(b"\x00")[0]
+            if not name:
+                return None
+            blk = _u32(d, QNX4_LINK_NAME)
+            ndx = d[QNX4_LINK_NAME + 4]
+            target = self._entry_at(self.boff(blk), ndx, require_name=False)
+            if target is None:
+                return None
+            target = dict(target)
+            target["name"] = name.decode("latin-1")
+            target["ino"] = blk * 64 + ndx
+            return target
+        name = d[0:QNX4_NAME].split(b"\x00")[0]
+        if not name and require_name:
+            return None
+        return {
+            "name": name.decode("latin-1") if name else "",
+            "size": _u32(d, 0x10),
+            "first": _u32(d, 0x14),          # first extent: start block
+            "xsize": _u32(d, 0x18),          # first extent: block count
+            "xblk": _u32(d, 0x1C),           # extent-block chain, if any
+            "ftime": _u32(d, 0x20),
+            "mtime": _u32(d, 0x24),
+            "num_xtnts": _u16(d, 0x30),
+            "mode": _u16(d, 0x32),
+            "uid": _u16(d, 0x34),
+            "gid": _u16(d, 0x36),
+            "status": status,
+            "levels": 0,                      # for display parity with QNX6
+            "ptr": [],
+            "ino": (off - self.base) // QNX4_BS * 64 + idx,
+        }
+
+    # -- extents --
+    def extents(self, inode):
+        """[(start_block, block_count)] for a file, following any extent blocks."""
+        out = []
+        if inode["xsize"]:
+            out.append((inode["first"], inode["xsize"]))
+        xblk = inode.get("xblk") or 0
+        seen = set()
+        while xblk and xblk not in seen and len(out) < 4096:
+            seen.add(xblk)
+            # Extent block: u32 next, u32 prev, u8 count, .., 60 extents at 0x10,
+            # then an 8-byte "IamXblk" signature at 0x1F0.
+            d = self.img.read(self.boff(xblk), QNX4_BS)
+            if len(d) < QNX4_BS or not d[0x1F0:0x1F8].startswith(_QNX4_XBLK_SIG):
+                break
+            count = d[0x08]
+            for i in range(min(count, 60)):
+                o = 0x10 + i * 8
+                blk, cnt = _u32(d, o), _u32(d, o + 4)
+                if cnt:
+                    out.append((blk, cnt))
+            xblk = _u32(d, 0x00)              # next extent block
+        return out
+
+    # -- data --
+    def read_range(self, inode, start=0, length=None):
+        size = inode["size"]
+        if length is None:
+            length = size
+        end = min(start + length, size)
+        out = bytearray()
+        pos = 0
+        for blk, cnt in self.extents(inode):
+            run = cnt * QNX4_BS
+            if pos + run <= start:
+                pos += run
+                continue
+            data = self.img.read(self.boff(blk), run)
+            take_from = max(0, start - pos)
+            out += data[take_from:take_from + (end - max(start, pos))]
+            pos += run
+            if len(out) >= end - start:
+                break
+        return bytes(out[:max(0, end - start)])
+
+    def read_file(self, inode):
+        return self.read_range(inode, 0, inode["size"])
+
+    def link_target(self, inode):
+        return self.read_file(inode).rstrip(b"\x00").decode("latin-1")
+
+    # -- directories --
+    def dirents(self, inode):
+        out = []
+        for blk, cnt in self.extents(inode):
+            for b in range(blk, blk + cnt):
+                off = self.boff(b)
+                d = self.img.read(off, QNX4_BS)
+                if len(d) < QNX4_BS:
+                    break
+                for i in range(QNX4_BS // QNX4_ENTRY):
+                    raw = d[i * QNX4_ENTRY:(i + 1) * QNX4_ENTRY]
+                    st = raw[0x3F]
+                    # Reject unallocated tail: undefined status bits mean noise.
+                    if st & QNX4_STATUS_MASK:
+                        continue
+                    if not st & (QNX4_FILE_USED | QNX4_FILE_LINK):
+                        continue
+                    e = self._parse_entry(raw, off, i)
+                    if e is None:
+                        continue
+                    nm = e["name"]
+                    if nm in (".", "..") or not nm:
+                        continue
+                    # Housekeeping files QNX4 keeps in every directory.
+                    if nm in (".longfilenames", "IamTHE.inodeFILE", ".inodes",
+                              ".bitmap", ".boot", ".altboot"):
+                        continue
+                    out.append(e)
+        return out
+
+    def walk(self, start=None, path="", max_entries=200000):
+        root = start if isinstance(start, dict) else self.root
+        out = [(path or "/", root)]
+        stack = [(root, path)]
+        seen = set()
+        while stack and len(out) < max_entries:
+            node, prefix = stack.pop()
+            key = (node["first"], node["ino"])
+            if key in seen:
+                continue
+            seen.add(key)
+            if not is_dir(node):
+                continue
+            for e in self.dirents(node):
+                p = prefix + "/" + e["name"]
+                e = dict(e)
+                e["path"] = p
+                out.append((p, e))
+                if is_dir(e):
+                    stack.append((e, p))
+        return out
+
+    def verify(self):
+        res = []
+        res.append(("root inode", self.root["name"] == "/",
+                    "block 1 holds the root directory"))
+        ents = self.dirents(self.root)
+        res.append(("root readable", len(ents) > 0, "%d entries" % len(ents)))
+        bad = sum(1 for _p, i in self.walk()
+                  if not is_dir(i) and i["size"] and not self.extents(i))
+        res.append(("extents resolve", bad == 0,
+                    "%d files with no extent" % bad))
         return res
 
 

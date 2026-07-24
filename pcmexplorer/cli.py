@@ -3,7 +3,7 @@ import os
 import sys
 
 from .core import (DiskImage, build_paths, hexdump, human, is_dir, is_link,
-                   mode_str)
+                   mode_str, safe_name)
 
 USAGE = """PCM Explorer -- browse a Porsche PCM / Audi MMI hard-drive image.
 
@@ -61,7 +61,8 @@ def cmd_ls(img, pname, sub):
             except Exception:
                 pass
         print("  %s %10s  %-52s [ino %d]%s"
-              % (mode_str(i["mode"]), size, pth + kind, i["ino"], extra))
+              % (mode_str(i["mode"]), size, safe_name(pth + kind), i["ino"],
+                 safe_name(extra)))
         n += 1
     print("\n  %d entries" % n)
     return 0
@@ -114,7 +115,7 @@ def cmd_extract(img, pname, path, dest):
                 fh.write(data)
             n += 1
             total += len(data)
-            print("  %s  (%s)" % (rel, human(len(data))))
+            print("  %s  (%s)" % (safe_name(rel), human(len(data))))
         print("\n  %d files, %s -> %s" % (n, human(total), dest))
     else:
         out = dest
@@ -153,11 +154,15 @@ def cmd_salvage(img, pname):
     paths = build_paths(dirs)
     print("%d directory blocks, %d paths recovered\n" % (len(dirs), len(paths)))
     for ino, pth in sorted(paths.items(), key=lambda kv: kv[1]):
-        print("  %-62s [ino %d]%s" % (pth, ino, "/" if ino in dirs else ""))
+        print("  %-62s [ino %d]%s" % (safe_name(pth), ino, "/" if ino in dirs else ""))
     return 0
 
 
 def main(argv):
+    try:                       # console codepages vary; never crash on output
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(USAGE)
         return 0

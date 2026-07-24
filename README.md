@@ -2,10 +2,11 @@
 
 **Open and browse the hard drive out of a Porsche PCM or Audi MMI head unit — on your desktop, read-only.**
 
-These units run QNX, and their drives use the QNX6 "power-safe" filesystem. Windows can't
-read it. macOS can't read it. Linux ships a read-only `qnx6` driver aimed at QNX 6.4+, which
-doesn't fully match the Harman variant these head units actually use. So when a head unit
-dies and you image the drive, you get a 40 GB file that nothing will open.
+These units run QNX, and their drives use the **QNX6** "power-safe" filesystem — or **QNX4**
+on older drives and on the navigation partition of every one. Windows can't read either.
+macOS can't. Linux ships a read-only `qnx6` driver aimed at QNX 6.4+, which doesn't match the
+Harman variant these head units actually use. So when a head unit dies and you image the
+drive, you get a 40 GB file that nothing will open.
 
 This opens it.
 
@@ -20,8 +21,8 @@ python explorer.py disk.img verify P2                # filesystem self-test
 
 ## What it does
 
-- **Maps the partitions** and identifies the filesystem in each, reading real geometry
-  (block size, inode counts, allocation groups) from the QNX6 superblock.
+- **Maps the partitions** and identifies the filesystem in each — **QNX6 and QNX4** — reading
+  real geometry (block size, inode counts, allocation groups) from the QNX6 superblock.
 - **Lists every file and folder**, with sizes, permissions and inode numbers.
 - **Reads file contents** — preview in the UI, `cat` to stdout, or extract a single file
   or an entire folder tree to disk. Handles files of any size, sparse holes and symlinks.
