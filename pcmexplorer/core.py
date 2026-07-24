@@ -59,11 +59,18 @@ LIVE_STATUS = (1, 3)
 
 S_IFMT, S_IFDIR, S_IFREG, S_IFLNK = 0xF000, 0x4000, 0x8000, 0xA000
 
+# Harman reuses the QNX4-era type bytes for partitions that actually carry QNX6
+# filesystems, and the same byte means different things on different platforms
+# (0x4D is the system partition on a Porsche PCM but the nav partition on an Audi
+# MMI). So the type is a hint only -- detect_fs() probes for a real superblock.
 PART_TYPES = {
-    0x4d: "QNX", 0x4e: "QNX", 0x4f: "QNX",
+    0x4d: "QNX", 0x4e: "QNX", 0x4f: "QNX", 0xbb: "QNX (logical)",
+    0x05: "extended", 0x0f: "extended (LBA)", 0x85: "extended (Linux)",
     0x07: "NTFS/exFAT", 0x0b: "FAT32", 0x0c: "FAT32 (LBA)",
     0x83: "Linux", 0x82: "Linux swap",
 }
+
+EXTENDED_TYPES = (0x05, 0x0f, 0x85)
 
 
 # ------------------------------------------------------------------ helpers --
@@ -163,10 +170,17 @@ class DiskImage:
 
     # -- partitions --
     def _read_mbr(self):
+        """Primary partitions, plus any logical ones inside an extended partition.
+
+        Audi MMI drives put five partitions (gracenode, mmebackup1, persistence,
+        img-cache, pv-cache) inside an extended partition, so stopping at the four
+        primary entries would silently miss most of the disk.
+        """
         mbr = self.read(0, 512)
         parts = []
         if len(mbr) < 512 or mbr[510:512] != b"\x55\xaa":
             return parts
+        extended = None
         for i in range(4):
             e = mbr[446 + i * 16: 446 + (i + 1) * 16]
             ptype = e[4]
@@ -174,15 +188,57 @@ class DiskImage:
             cnt = _u32(e, 12)
             if ptype == 0 or cnt == 0:
                 continue
-            parts.append({
+            entry = {
                 "name": "P%d" % (i + 1),
                 "type": ptype,
                 "type_name": PART_TYPES.get(ptype, "0x%02x" % ptype),
                 "base": lba * SECTOR,
                 "length": cnt * SECTOR,
                 "bootable": e[0] == 0x80,
-            })
+                "logical": False,
+            }
+            parts.append(entry)
+            if ptype in EXTENDED_TYPES and extended is None:
+                extended = lba * SECTOR
+        if extended is not None:
+            parts.extend(self._read_logicals(extended))
         return parts
+
+    def _read_logicals(self, ext_base, max_chain=64):
+        """Walk the extended-boot-record chain.
+
+        Each EBR holds two useful entries: the logical partition itself (offset
+        relative to that EBR) and a pointer to the next EBR (relative to the start
+        of the extended partition).
+        """
+        out = []
+        ebr = ext_base
+        n = 0
+        seen = set()
+        while ebr and n < max_chain and ebr not in seen:
+            seen.add(ebr)
+            rec = self.read(ebr, 512)
+            if len(rec) < 512 or rec[510:512] != b"\x55\xaa":
+                break
+            e0 = rec[446:462]
+            ptype, lba, cnt = e0[4], _u32(e0, 8), _u32(e0, 12)
+            if ptype and cnt:
+                n += 1
+                out.append({
+                    "name": "L%d" % n,
+                    "type": ptype,
+                    "type_name": PART_TYPES.get(ptype, "0x%02x" % ptype),
+                    "base": ebr + lba * SECTOR,
+                    "length": cnt * SECTOR,
+                    "bootable": e0[0] == 0x80,
+                    "logical": True,
+                })
+            e1 = rec[462:478]
+            nxt = _u32(e1, 8)
+            if e1[4] == 0 or nxt == 0:
+                break
+            ebr = ext_base + nxt * SECTOR
+        return out
 
     def part(self, name):
         for p in self.parts:

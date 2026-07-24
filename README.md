@@ -110,12 +110,29 @@ from a copy rather than the original drive is still the right habit.
 pairings and call history. Treat an image — and any exported tree — as personal data. The
 `.gitignore` here deliberately excludes `*.img` so you can't commit one by accident.
 
+## Audi MMI
+
+MMI 3G/3GP drives are also Harman-built and also **QNX6** — every partition on them is
+created with `mkqnx6fs`, and they reuse the same partition type bytes (`0x4D`/`0x4E`/`0x4F`)
+as the Porsche drives. The roles differ, though: on an MMI drive `0x4D` is the navigation
+partition, while on a PCM it's the system partition. So the type byte is a hint, not an
+answer — this tool probes each partition for a real superblock instead of trusting it.
+
+MMI also places five further partitions (`gracenode`, `mmebackup1`, `persistence`,
+`img-cache`, `pv-cache`) inside an **extended partition**, so PCM Explorer walks the
+extended-boot-record chain and lists logical partitions as `L1`, `L2`, … Stopping at the
+four primary entries would miss most of the disk, including `persistence`.
+
+That layout is derived from [DrGER's MMI3G-HDD-Prep-Tool](https://github.com/DrGER2/MMI3G-HDD-Prep-Tool),
+which formats these drives. The extended-partition handling is verified against a
+synthetic disk built to that layout; **it has not yet been run against a real MMI image** —
+if you have one, an issue saying whether it worked would be genuinely useful.
+
 ## Contributing
 
-Images from other units are genuinely useful, particularly **Audi MMI** (also Harman-built,
-likely a similar layout — untested, we don't have one) and **PCM 4.x**. If the tool reports
-`unknown` on your image, that's a data point worth opening an issue over: partition table,
-sizes, and the first 512 bytes of each partition are enough to start.
+Images from other units are welcome, particularly **Audi MMI** and **PCM 4.x**. If the tool
+reports `unknown` on your image, that's a data point worth opening an issue over: the
+partition table, sizes, and the first 512 bytes of each partition are enough to start.
 
 Its sibling project [PCM-Forge](https://github.com/dspl1236/PCM-Forge) covers activation
 codes and on-car tooling for the PCM 3.1.
