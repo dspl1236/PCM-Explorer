@@ -10,36 +10,68 @@ dies and you image the drive, you get a 40 GB file that nothing will open.
 This opens it.
 
 ```
-python explorer.py                      # desktop UI
-python explorer.py disk.img             # partition table + filesystem detection
-python explorer.py disk.img tree P2      # directory tree
+python explorer.py                                   # desktop UI
+python explorer.py disk.img                          # partitions + filesystem detection
+python explorer.py disk.img ls P2                    # list every file
+python explorer.py disk.img cat P2 /HBdata/version.txt
+python explorer.py disk.img extract P2 /Browser ./out # pull a file or a whole folder
+python explorer.py disk.img verify P2                # filesystem self-test
 ```
 
 ## What it does
 
 - **Maps the partitions** and identifies the filesystem in each, reading real geometry
-  (block size, inode counts, allocation groups) out of the QNX6 superblock.
-- **Rebuilds the directory tree** — every file and folder on the drive, with inode numbers.
-- **Hex view** at any byte offset, for poking at things directly.
-- **Exports the tree** to a text file so you can diff two drives or send someone a listing.
+  (block size, inode counts, allocation groups) from the QNX6 superblock.
+- **Lists every file and folder**, with sizes, permissions and inode numbers.
+- **Reads file contents** — preview in the UI, `cat` to stdout, or extract a single file
+  or an entire folder tree to disk. Handles files of any size, sparse holes and symlinks.
+- **Verifies itself** against the filesystem's own accounting (see below).
+- **Salvage mode** for drives too damaged to mount, and a hex view of any byte offset.
 
-The tree reconstruction **does not depend on the superblock.** Every QNX6 directory block
-identifies itself: its first entry is `.` holding its own inode number, its second is `..`
-holding its parent's. PCM Explorer sweeps the partition for that signature and rebuilds the
-hierarchy from the fragments. That means it still works on drives where the metadata chain
-is damaged, partially zeroed, or simply doesn't match the documented layout — which is
-exactly the situation you're in when a unit has failed.
+## Does it actually work?
 
-## What it can't do yet
+That's the right question to ask of a recovery tool, so it ships with a `verify` command
+that checks the reader against the filesystem's own bookkeeping:
 
-**Extracting file contents is not solved.** QNX6 scrambles inode numbers across allocation
-groups, and on the Harman 6.3.2 build the superblock's inode-file chain doesn't describe
-that mapping. Files whose inode can't be located are reported as such — the tool will not
-write a file it isn't confident about, because a recovery tool that quietly produces garbage
-is worse than one that admits the gap.
+```
+[PASS] geometry             (plen/bs) - num_blocks == 16
+[PASS] inode census         376 live, superblock says 376
+[PASS] block bitmap         546413 clear, superblock says 546413 free
+[PASS] directory identity   20 directories checked, 0 inconsistent
+```
 
-Work in progress; see [docs/QNX6-NOTES.md](docs/QNX6-NOTES.md) for what's been established
-so far and where the remaining problem sits.
+The block-bitmap check is the interesting one: it reaches the bitmap through a different
+root node and a different block chain than the inode logic, so it independently confirms
+the reader is looking in the right place.
+
+During development the extracted bytes were validated by content as well — every PNG
+chunk CRC on the drive (970/970), ELF section tables on all 47 binaries (several ending
+*exactly* at EOF, which proves the last block of a multi-level file map is correct),
+`PRAGMA integrity_check` on the SQLite databases, and the ISO9660 descriptor of a 387 MB
+image read correctly through two levels of indirection.
+
+## Salvage mode
+
+If a drive is damaged badly enough that the superblock is unreadable, `salvage` recovers
+the directory structure anyway. Every QNX6 directory block identifies itself — its first
+entry is `.` holding its own inode number, its second is `..` holding its parent's — so
+sweeping the raw partition for that signature rebuilds the hierarchy with no metadata at
+all. You get names and structure but not contents, which is usually enough to know what
+was on a drive and whether deeper recovery is worth it.
+
+## How it works
+
+The format is documented in [docs/QNX6-NOTES.md](docs/QNX6-NOTES.md) — enough to write your
+own reader. The short version: everything hinges on one constant. Block numbers are
+relative to the start of the *data area*, not the partition:
+
+```
+image_offset(block B) = partition_base + 0x3000 + B * blocksize
+```
+
+Miss that 12 KiB and every indirect chain lands in unrelated data and reads as though the
+filesystem were full of holes — which is exactly why this variant looked proprietary. It
+isn't. With the right origin it matches the public QNX6 layout.
 
 ## Install
 

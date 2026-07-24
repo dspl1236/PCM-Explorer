@@ -1,123 +1,200 @@
-# QNX6 on Harman head units — what we know
+# QNX6 on Harman head units — on-disk layout
 
-Field notes from reverse-engineering the on-disk layout of a Porsche PCM 3.1 drive
-(QNX 6.3.2, Harman Becker, SH4). Recorded because the public documentation does not
-fully describe this variant, and the differences are the whole reason a normal QNX6
-reader fails on these drives.
+Reverse-engineered from a Porsche PCM 3.1 drive (QNX 6.3.2, Harman Becker, SH4) and
+verified against it. Written down because the public documentation doesn't describe
+where these images actually put things, and one wrong constant makes the whole
+filesystem look proprietary when it isn't.
 
-Everything below was measured against a real 40 GB PCM 3.1 image unless noted.
+Everything here is measured, not inferred.
+
+## The block origin — the one thing that matters
+
+Every block number stored anywhere on the filesystem — superblock root-node pointers,
+indirect-block entries, inode block pointers — is relative to the **start of the data
+area**, not the start of the partition:
+
+```
+image_offset(block B) = partition_base + 0x3000 + B * blocksize
+```
+
+```
+0x0000 - 0x1FFF   boot block        (8 blocks)
+0x2000 - 0x2FFF   superblock area   (4 blocks; the struct itself at 0x2000)
+0x3000            data block 0
+```
+
+Get this wrong and every indirect chain lands 12 KiB early, in the middle of unrelated
+file data, and reads as though it were full of holes. That single mistake is what made
+this filesystem look like an undocumented Harman variant. **It isn't one** — once the
+origin is right, the layout matches the public QNX6 one exactly.
+
+Sanity check available at mount time, true on both partitions:
+
+```
+(partition_length / blocksize) - num_blocks == 16      # 12 front + 4 tail superblock
+```
 
 ## Partition layout
 
-MBR, three QNX partitions (types `0x4d` / `0x4e` / `0x4f`):
+| part | type | start LBA | size | filesystem | contents |
+|------|------|-----------|------|------------|----------|
+| P1 | 0x4d | 32 | ~2.0 GB | QNX6 | `/.boot`, `/log` (watchdog dumps), `/tools` |
+| P2 | 0x4e | 4096000 | ~1.0 GB | QNX6 | `/Browser`, `/HBdata`, `/MapStyles`, `/acios`, `/bootscreens`, `/mmi`, `/nobss`, `/qdb_backup`, `/xm` |
+| P3 | 0x4f | 6144000 | ~36.9 GB | **QNX4** | navigation data — different filesystem, not covered here |
 
-| part | type | start LBA | size | contents |
-|------|------|-----------|------|----------|
-| P1 | 0x4d | 32 | ~2.0 GB | system — `/.boot`, `/log`, `/tools` |
-| P2 | 0x4e | 4096000 | ~1.0 GB | applications — `/Browser`, `/HBdata`, `/MapStyles`, `/acios`, `/bootscreens`, `/mmi`, `/nobss`, `/qdb_backup`, `/xm` |
-| P3 | 0x4f | 6144000 | ~36.9 GB | navigation data |
+## Superblock
 
-P3 has **no QNX6 superblock** at the usual offsets — either a different format or a
-container. Not yet identified.
+Magic `0x68191122` little-endian. The power-safe filesystem keeps **two** copies:
 
-## Superblocks
+- `base + 0x2000` (front)
+- `base + length - 0x1000` (tail)
 
-Magic `0x68191122`, little-endian. The power-safe filesystem keeps **two** superblocks
-and the live one is whichever has the **higher serial**:
-
-- `base + 0x2000` (start + 8 KB)
-- `base + length - 0x1000` (end − 4 KB)
-
-Field offsets, verified:
+**Always pick the one with the higher `u64` serial at `+0x08`.** Which copy is live is not
+consistent — on the measured drive P1's live copy is the front one and P2's is the tail
+one. The stale copy is readable but disagrees by a few inodes (a transaction that was in
+flight), so choosing wrong gives subtly wrong answers rather than an obvious failure.
 
 | offset | field |
 |--------|-------|
 | 0x00 | magic |
-| 0x08 | serial (u64) |
+| 0x08 | serial (u64) — higher wins |
 | 0x30 | blocksize |
 | 0x34 | num_inodes |
 | 0x38 | free_inodes |
 | 0x3c | num_blocks |
 | 0x40 | free_blocks |
 | 0x44 | allocation groups |
-| 0x50 | inode-file pointer |
-| 0x90 | inode-file levels |
+| 0x48 | root node: **inode table** |
+| 0x98 | root node: **block bitmap** |
+| 0xE8 | root node: **long filenames** |
+| 0x138 | root node: spare |
 
-Measured geometry — note the two partitions differ, so don't hardcode either:
+Each root node is 80 bytes: `size` u64 `@+0x00`, `ptr[16]` u32 `@+0x08`, `levels` u8
+`@+0x48`, `mode` u8 `@+0x49`.
+
+Measured geometry — the two partitions differ, so don't hardcode either:
 
 ```
-P1:  blocksize=1024  inodes 61/64000    blocks 2047968  groups=8
-P2:  blocksize=1024  inodes 376/128000  blocks 1023984  groups=4
+P1  bs 1024  inodes 61/64000    blocks 2047968  groups 8   live SB @0x6000      serial 20599
+P2  bs 1024  inodes 376/128000  blocks 1023984  groups 4   live SB @0xBB7FF000  serial 143950
 ```
 
-Block `B` → byte offset `partition_base + B * blocksize`.
+## The block map
 
-## Directory blocks — the reliable way in
+One routine drives everything — file data, the inode table, the block bitmap, the
+long-filename table. Only the root pointers and the level count differ.
 
-Directory entries are **32 bytes**: `u32 inode`, `u8 namelen`, `name[]`.
+```python
+ppb = blocksize // 4                      # 256 pointers per indirect block
 
-Crucially, every directory block is **self-identifying**: entry 0 is `.` and holds the
-directory's own inode number; entry 1 is `..` and holds its parent's. So the whole
-hierarchy can be rebuilt by scanning the raw partition for that signature — no
-superblock, no inode file, no allocation-group math required.
+def map_block(ptrs, levels, n):           # logical block n -> physical block
+    span = ppb ** levels
+    if n // span >= 16:
+        return None
+    b, n = ptrs[n // span], n % span
+    for _ in range(levels):
+        if b == NIL:
+            return None
+        span //= ppb
+        b = u32_le(read(boff(b), blocksize), (n // span) * 4)
+        n %= span
+    return None if b == NIL else b
+```
 
-This is what PCM Explorer does, and it's why it still works on damaged drives. It is
-strictly more robust than following the documented metadata chain, which on this build
-is a dead end (below).
+`levels` caps file size: 0 → 16 KiB (16 direct blocks), 1 → 4 MiB, 2 → 1 GiB, 3 → 256 GiB.
+Never special-case "direct vs indirect" — the uniform routine covers every case. A `None`
+result is a sparse hole and reads as zeros; that's legal, not an error.
 
-## The unsolved part: inode number → inode struct
+## Inodes
 
-Inode structs are 128 bytes:
+The inode table is **itself a file**, whose block map is the superblock's first root node.
+Inode N (1-based) lives at byte `(N-1) * 128` of that file:
+
+```python
+def inode_offset(N):
+    fo = (N - 1) * 128
+    if fo >= rn_inodes.size:
+        return None
+    db = map_block(rn_inodes.ptr, rn_inodes.levels, fo // blocksize)
+    return None if db is None else boff(db) + (fo % blocksize)
+```
+
+Struct (128 bytes) — identical to the public layout:
 
 | offset | field |
 |--------|-------|
 | 0x00 | size (u64) |
-| 0x08 | uid |
+| 0x08 | uid | 
 | 0x0c | gid |
+| 0x10 | ftime |
 | 0x14 | mtime |
+| 0x18 | atime |
+| 0x1c | ctime |
 | 0x20 | mode (u16) |
-| 0x24 | block_ptr[16] (u32 each, `0xffffffff` = nil) |
+| 0x24 | block_ptr[16] (u32, `0xffffffff` = nil) |
 | 0x64 | filelevels |
 | 0x65 | status |
 
-QNX6 does **not** store inodes in inode-number order — they're distributed across the
-allocation groups, and the mapping is supposed to live in the superblock's "inode file"
-(a tree, `levels=2`).
+`status`: 0 = free, **1 and 3 = live**, 2 = unlinked but not yet released. Filtering on
+`status in (1, 3)` yields exactly `num_inodes - free_inodes` on both partitions; counting
+`!= 0` instead over-counts by the unlinked ones.
 
-**On this build that chain is a dead end.** Both superblocks' inode-file indirect
-pointers read as empty/holes, and nothing in the first 16 MB points at the inode blocks
-that *are* populated (physical blocks `0x4008`–`0x4020`). So the public layout does not
-describe this variant.
+### There is no inode → offset formula, and there cannot be
 
-### The strongest lead
+This is a copy-on-write filesystem. Rewritten metadata gets relocated, so inode offsets
+aren't even monotonic: on the measured drive inode 16 sits at `0x7E002780` but inode 17 at
+`0x7D033000` — 16 MB *backwards*. The inode file's own logical blocks run
+`0x3ffc, 0x3ffd, 0xc0, 0x3fff, 0x4000, 0xc3 …`, COW relocations interleaved with the
+original `mkqnx6fs` layout.
 
-Recovered inode numbers land on clean allocation-group boundaries:
+Fitting a closed form reproduces 0.1% of offsets. Walking the tree reproduces 100%.
 
-- **P2** (`num_inodes=128000`, 4 groups → 32000 per group): root/`.boot`/`.placeholder`
-  at `1, 2, 7` (group 0), then `64004, 64005` (group 2), then `96001–96087` (group 3).
-- **P1** (`num_inodes=64000`, 8 groups → 8000 per group): `/log` and `/tools` at
-  `56001, 56003` (group 7).
+> **A correction worth recording.** An earlier pass at this filesystem — including an
+> earlier draft of this document — concluded that inode numbers were "scrambled across
+> allocation groups," on the evidence that recovered inode numbers landed on clean
+> `num_inodes / groups` boundaries. That observation is real (QNX6 does hand out inode
+> numbers per allocation group) but the conclusion drawn from it was wrong. Nothing is
+> scrambled. The apparent disorder was COW relocation, and the reason the metadata chain
+> looked empty was the missing `0x3000`, not a proprietary layout.
 
-Two partitions with different group counts both landing exactly on `num_inodes / groups`
-boundaries is strong evidence the scheme is simple group-blocking —
-`group = inode / (num_inodes / groups)` — rather than round-robin interleaving.
+## Directories
 
-### Ways to finish it
+Directory data is an array of 32-byte entries: `u32 inode`, `u8 namelen`, `name[27]`.
 
-1. **Empirical correlation.** Directories are self-identifying, so for any candidate
-   inode struct you can follow `block_ptr[0]`, read that block, and if it's a directory
-   block the `.` entry tells you the struct's *true* inode number. That yields
-   ground-truth pairs across the whole disk, from which the permutation can be fitted
-   and then tested on held-out pairs. Most promising, needs no external information.
-2. **Reverse the QNX tools.** `mkqnx6fs` and `chkqnx6fs` ship on the unit itself
-   (`/mnt/data/tools`) and contain the real block-map logic.
-3. **Check for a second metadata copy.** A power-safe filesystem keeps two superblocks;
-   the inode file may be double-buffered too, and the live copy may simply not be the
-   one that was followed.
+- `inode == 0` → **tombstone** (deleted entry). Skip it. The name bytes are often still
+  readable, so failing to skip these invents files that don't exist.
+- `namelen == 0xFF` → **long name**, stored out of line. The block index is a `u32` at
+  **`+8`** (not `+5`): `block = map_block(rn_longfile.ptr, rn_longfile.levels, index)`,
+  and that block holds a `u16` length followed by the name. Getting the offset wrong
+  silently drops files rather than erroring.
+- otherwise → plain name of that length.
 
-## Reading a drive without any of this
+Directories are ordinary files: read them through the same block map, and read **all**
+their blocks — one directory on the measured drive is 9,216 bytes / 258 entries.
 
-If the unit still powers on, it can read its own disk. Enabling networking and using
-the on-unit shell sidesteps the filesystem question entirely — see
-[PCM-Forge](https://github.com/dspl1236/PCM-Forge). Offline reading matters when the
+Symlinks (`mode & 0xF000 == 0xA000`) store their target as file contents, e.g.
+`/acios/SDS.iso` → `/mnt/nav/pkgdb/SDS_NA_4_4_1/SDS_Data.iso`.
+
+## Verifying an implementation
+
+Four checks, each catching a different class of error. PCM Explorer ships them as
+`verify` and all four pass on both partitions:
+
+1. **Geometry** — `(plen / bs) - num_blocks == 16`. Catches a wrong block origin instantly.
+2. **Inode census** — count `status in (1,3)` over `1..num_inodes`; must equal
+   `num_inodes - free_inodes`.
+3. **Block bitmap popcount** — count clear bits in the bitmap (reached through a
+   *different* root node and block chain) and compare to `free_blocks`. This one is
+   independent of all inode logic, so it validates the block origin on its own.
+4. **Directory identity** — every directory's first entry must be `.` pointing at itself
+   and its second `..`.
+
+Beyond those, content-level validation is what actually proves byte correctness: PNG
+chunk CRCs, ELF section tables (several files end *exactly* at EOF, which proves the last
+block of a multi-level map is right), and SQLite `PRAGMA integrity_check`.
+
+## If the unit still powers on
+
+You don't need any of this. A live head unit can read its own disk over a network shell —
+see [PCM-Forge](https://github.com/dspl1236/PCM-Forge). Offline reading matters when the
 unit is dead, which is exactly when you need it most.
