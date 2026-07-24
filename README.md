@@ -86,9 +86,13 @@ python explorer.py
 
 ### Windows without Python
 
-Download **[PCM-Explorer.exe](../../releases/latest)** — a standalone build, no install
-required. It's rebuilt automatically from `main`, and every build runs the test suite
-first, so a broken reader never ships as a download. Each one is published with its SHA256.
+Download **[PCM-Explorer.exe](https://github.com/dspl1236/PCM-Explorer/releases/download/latest/PCM-Explorer.exe)**
+— a standalone build, no install required. That link always serves the current build of
+`main`; numbered [releases](../../releases) are there if you'd rather pin a version.
+
+Every build runs the test suite first, so a broken reader never ships as a download, and
+each one is published with its
+[SHA256](https://github.com/dspl1236/PCM-Explorer/releases/download/latest/PCM-Explorer.exe.sha256).
 
 The exe is unsigned, so SmartScreen will warn on first run: **More info → Run anyway**.
 If you'd rather not, running from source above does exactly the same thing.
