@@ -1,0 +1,62 @@
+name: Build Windows exe
+
+# Builds a standalone PCM-Explorer.exe so Windows users don't need Python.
+# Runs on a version tag (v0.1.0, v0.2.0, ...) and attaches the exe to the
+# release. Can also be triggered by hand from the Actions tab.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build
+        # --windowed: no console window behind the UI. The exe is the desktop
+        # app; anyone wanting the CLI should run the Python source instead.
+        run: >
+          pyinstaller --onefile --windowed
+          --name PCM-Explorer
+          --collect-submodules pcmexplorer
+          explorer.py
+
+      - name: Checksum
+        run: |
+          Get-FileHash dist\PCM-Explorer.exe -Algorithm SHA256 |
+            Select-Object -ExpandProperty Hash |
+            Out-File -Encoding ascii dist\PCM-Explorer.exe.sha256
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PCM-Explorer-windows
+          path: |
+            dist/PCM-Explorer.exe
+            dist/PCM-Explorer.exe.sha256
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/PCM-Explorer.exe
+            dist/PCM-Explorer.exe.sha256
+          body: |
+            Standalone Windows build — no Python needed.
+
+            The exe is unsigned, so SmartScreen will warn on first run:
+            "More info" -> "Run anyway". Verify against the published SHA256
+            if you'd like, or run from source instead.

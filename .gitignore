@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# PyInstaller
+*.spec
+
+# Never commit disk images or extracted vehicle data -- they contain VINs,
+# saved navigation destinations and phone pairings.
+*.img
+*.dd
+*.raw
+tree.txt
