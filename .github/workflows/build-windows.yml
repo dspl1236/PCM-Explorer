@@ -1,15 +1,31 @@
 name: Build Windows exe
 
-# Builds a standalone PCM-Explorer.exe so Windows users don't need Python.
-# Runs on a version tag (v0.1.0, v0.2.0, ...) and attaches the exe to the
-# release. Can also be triggered by hand from the Actions tab.
+# Every code push to main rebuilds the exe and refreshes the rolling "latest"
+# download. Pushing a version tag (v0.2.0, ...) additionally cuts a numbered
+# release, and prunes older ones so the release page stays tidy.
+#
+# Tests run first -- a build that fails them never becomes a download.
+
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".gitignore"
+      - "LICENSE"
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# A newer push supersedes an in-flight build of the same ref.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -19,14 +35,22 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
+          # Pinned deliberately: releases should not drift with whatever Python
+          # happens to be current.
           python-version: "3.12"
+
+      - name: Smoke tests
+        run: python tests/test_smoke.py
+
+      - name: CLI sanity check
+        run: python explorer.py --help
 
       - name: Install PyInstaller
         run: pip install pyinstaller
 
       - name: Build
         # --windowed: no console window behind the UI. The exe is the desktop
-        # app; anyone wanting the CLI should run the Python source instead.
+        # app; the CLI is for people running from source.
         run: >
           pyinstaller --onefile --windowed
           --name PCM-Explorer
@@ -34,11 +58,13 @@ jobs:
           explorer.py
 
       - name: Checksum
-        run: |
-          Get-FileHash dist\PCM-Explorer.exe -Algorithm SHA256 |
-            Select-Object -ExpandProperty Hash |
-            Out-File -Encoding ascii dist\PCM-Explorer.exe.sha256
         shell: pwsh
+        run: |
+          $h = (Get-FileHash dist\PCM-Explorer.exe -Algorithm SHA256).Hash
+          "$h  PCM-Explorer.exe" | Out-File -Encoding ascii dist\PCM-Explorer.exe.sha256
+          Write-Host "SHA256: $h"
+          $mb = [math]::Round((Get-Item dist\PCM-Explorer.exe).Length / 1MB, 1)
+          Write-Host "Size: $mb MB"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -46,17 +72,68 @@ jobs:
           path: |
             dist/PCM-Explorer.exe
             dist/PCM-Explorer.exe.sha256
+          retention-days: 14
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
+      # --- rolling build from main: one download, always current ---
+      - name: Update "latest" build
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build from main
+          prerelease: true
+          files: |
+            dist/PCM-Explorer.exe
+            dist/PCM-Explorer.exe.sha256
+          body: |
+            Automatic build of the latest `main` (${{ github.sha }}).
+
+            No Python needed — download and run. The exe is unsigned, so
+            SmartScreen will warn on first run: **More info → Run anyway**.
+            Verify against the published SHA256 if you prefer, or run from source.
+
+            For a stable numbered build, see the releases below.
+
+      # --- tagged release ---
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/PCM-Explorer.exe
             dist/PCM-Explorer.exe.sha256
+          generate_release_notes: true
           body: |
             Standalone Windows build — no Python needed.
 
             The exe is unsigned, so SmartScreen will warn on first run:
-            "More info" -> "Run anyway". Verify against the published SHA256
-            if you'd like, or run from source instead.
+            **More info → Run anyway**. Verify against the published SHA256
+            if you prefer, or run from source.
+
+  # Keep the release page tidy: retain the 3 newest versioned releases.
+  # Tags are left alone (they cost nothing and preserve history); only the
+  # older binaries are removed.
+  prune:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete releases older than the 3 newest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          keep=3
+          mapfile -t old < <(
+            gh release list --limit 100 --json tagName,isPrerelease,createdAt \
+              --jq 'map(select(.isPrerelease == false and (.tagName | startswith("v"))))
+                    | sort_by(.createdAt) | reverse | .['"$keep"':][] | .tagName'
+          )
+          if [ ${#old[@]} -eq 0 ]; then
+            echo "Nothing to prune (keeping the $keep newest)."
+            exit 0
+          fi
+          for tag in "${old[@]}"; do
+            echo "Deleting release $tag (tag retained)"
+            gh release delete "$tag" --yes
+          done

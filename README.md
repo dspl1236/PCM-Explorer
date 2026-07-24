@@ -84,9 +84,21 @@ cd PCM-Explorer
 python explorer.py
 ```
 
-Windows users who'd rather not install Python can grab the prebuilt `.exe` from
-[Releases](../../releases). It's unsigned, so SmartScreen will warn on first run —
-"More info" → "Run anyway", or just use the Python version if you'd prefer not to.
+### Windows without Python
+
+Download **[PCM-Explorer.exe](../../releases/latest)** — a standalone build, no install
+required. It's rebuilt automatically from `main`, and every build runs the test suite
+first, so a broken reader never ships as a download. Each one is published with its SHA256.
+
+The exe is unsigned, so SmartScreen will warn on first run: **More info → Run anyway**.
+If you'd rather not, running from source above does exactly the same thing.
+
+### Tests
+
+```bash
+python tests/test_smoke.py                                    # synthetic images, no data needed
+PCM_TEST_IMAGE=/path/to/disk.img python tests/test_smoke.py   # adds full filesystem verification
+```
 
 ## Imaging a drive
 
