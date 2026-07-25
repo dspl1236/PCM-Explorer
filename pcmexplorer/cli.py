@@ -4,10 +4,13 @@ import sys
 
 from .core import (DiskImage, build_paths, hexdump, human, is_dir, is_link,
                    mode_str, safe_name)
+from .decode import preview, summarise_disk, summarise_firmware
+from .firmware import FirmwareImage, looks_like_ifs
 
 USAGE = """PCM Explorer -- browse a Porsche PCM / Audi MMI hard-drive image.
 
-  pcm-explorer <image>                      partitions + filesystem detection
+  pcm-explorer <image>                      summary -- what is this image?
+  pcm-explorer <image> parts                partitions + filesystem detection
   pcm-explorer <image> ls <part> [path]     list files (recursive)
   pcm-explorer <image> cat <part> <path>    print a file to stdout
   pcm-explorer <image> extract <part> <path> <dest>
@@ -17,8 +20,34 @@ USAGE = """PCM Explorer -- browse a Porsche PCM / Audi MMI hard-drive image.
   pcm-explorer <image> salvage <part>       recover names without a superblock
   pcm-explorer <image> gui                  open the desktop UI
 
+Accepts a raw disk image OR a firmware image (PCM3_IFS1.ifs / PCM3_IFS2.ifs).
+
 <part> is P1/P2/P3.  <offset> accepts 0x hex.  The image is opened read-only.
 """
+
+
+def _fw_ls(fw, sub):
+    n = 0
+    for pth, e in fw.entries():
+        if sub and not pth.startswith(sub):
+            continue
+        kind = "/" if is_dir(e) else ("@" if is_link(e) else "")
+        size = "" if is_dir(e) else human(e["size"])
+        extra = (" -> " + fw.link_target(e)) if is_link(e) else ""
+        print("  %s %10s  %-52s%s"
+              % (mode_str(e["mode"]), size, safe_name(pth + kind), safe_name(extra)))
+        n += 1
+    print("")
+    print("  %d entries" % n)
+    return 0
+
+
+def _fw_find(fw, path):
+    want = "/" + path.lstrip("/")
+    for pth, e in fw.entries():
+        if pth == want:
+            return pth, e
+    return None, None
 
 
 def _fs_or_die(img, pname):
@@ -87,9 +116,10 @@ def cmd_cat(img, pname, path):
         print("%s is a directory" % pth)
         return 1
     data = fs.read_file(i)
-    try:
-        sys.stdout.write(data.decode("utf-8"))
-    except UnicodeDecodeError:
+    txt = preview(pth, data)
+    if txt is not None:
+        print(txt)
+    else:
         sys.stdout.buffer.write(data)
     return 0
 
@@ -170,11 +200,59 @@ def main(argv):
     if not os.path.isfile(path):
         print("not a file: %s" % path)
         return 1
-    cmd = argv[1] if len(argv) > 1 else "parts"
+    cmd = argv[1] if len(argv) > 1 else "summary"
 
     if cmd == "gui":
         from .gui import run
         run(path)
+        return 0
+
+    # A firmware image is a different container but browses the same way.
+    if looks_like_ifs(path):
+        try:
+            fw = FirmwareImage(path)
+        except Exception as e:
+            print("not a readable firmware image: %s" % e)
+            return 1
+        a = argv[2:]
+        if cmd in ("parts", "summary"):
+            print(summarise_firmware(fw))
+        elif cmd == "ls":
+            return _fw_ls(fw, a[0] if a else None)
+        elif cmd == "cat":
+            if not a:
+                print("usage: cat <path>")
+                return 1
+            pth, e = _fw_find(fw, a[0])
+            if not e:
+                print("not found: %s" % a[0])
+                return 1
+            data = fw.read_file(e)
+            txt = preview(pth, data)
+            if txt is not None:
+                print(txt)
+            else:
+                sys.stdout.buffer.write(data)
+        elif cmd == "extract":
+            if len(a) < 2:
+                print("usage: extract <path> <dest>")
+                return 1
+            pth, e = _fw_find(fw, a[0])
+            if not e:
+                print("not found: %s" % a[0])
+                return 1
+            with open(a[1], "wb") as fh:
+                fh.write(fw.read_file(e))
+            print("  wrote %s (%s)" % (a[1], human(e["size"])))
+        elif cmd == "verify":
+            allok = True
+            for n, ok, det in fw.verify():
+                allok &= ok
+                print("  [%s] %-18s %s" % ("PASS" if ok else "FAIL", n, det))
+            return 0 if allok else 2
+        else:
+            print(USAGE)
+            return 1
         return 0
 
     img = DiskImage(path)
@@ -184,7 +262,9 @@ def main(argv):
             print("  no MBR partition table found")
             return 1
         a = argv[2:]
-        if cmd == "parts":
+        if cmd == "summary":
+            print(summarise_disk(img))
+        elif cmd == "parts":
             cmd_parts(img)
         elif cmd == "ls":
             return cmd_ls(img, a[0] if a else "P2", a[1] if len(a) > 1 else None)

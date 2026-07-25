@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pcmexplorer.core import (DiskImage, RootNode, hexdump, human, mode_str,
                               parse_dirents_raw, BLKOFF, QNX6_MAGIC)
+from pcmexplorer.decode import decode_cvalue, preview, odometer_from_logbook
+from pcmexplorer.firmware import looks_like_ifs, QNX_STARTUP_MAGIC, IFS2_LZO_OFFSET
 
 SEC = 512
 CYL = 64 * 63          # small geometry keeps the test images tiny
@@ -138,6 +140,51 @@ def test_rootnode():
     check("levels", rn.levels == 2)
 
 
+def test_decoders():
+    print("\ndecoders")
+    # A CVALUE frame is u16 tag, u16 id, u32 length, payload -- and 8+length must
+    # equal the file size. Build a coding-table one and check it round-trips.
+    body = struct.pack("<III", 0xDEADBEEF, 0x65, 0x14)      # crc, magic, hdr len
+    body += struct.pack("<II", 1, 0)                        # channel count, payload len
+    body += struct.pack("<HHHH", 0x64, 4, 7, 0) + struct.pack("<I", 1234)
+    blob = struct.pack("<HHI", 0x0a, 0x1234, len(body)) + body
+    out = decode_cvalue(blob)
+    check("decode_cvalue() recognises a coding table",
+          out is not None and "coding table" in out)
+    check("decode_cvalue() reads the channel", out is not None and "ch 0x064" in out)
+    check("decode_cvalue() rejects a non-CVALUE",
+          decode_cvalue(b"not a cvalue at all") is None)
+
+    elf = b"\x7fELF" + bytes(14) + struct.pack("<H", 42) + bytes(40)
+    check("preview() identifies an SH4 ELF", "SuperH" in (preview("/x", elf) or ""))
+    png = b"\x89PNG\r\n\x1a\n" + bytes(8) + struct.pack(">II", 640, 480) + bytes(8)
+    check("preview() identifies a PNG", "640x480" in (preview("/x.png", png) or ""))
+    check("preview() passes text through",
+          "hello" in (preview("/x.txt", b"hello world") or ""))
+    check("odometer_from_logbook() rejects non-sqlite",
+          odometer_from_logbook(b"nope") is None)
+
+
+def test_firmware_detect():
+    print("\nfirmware container detection")
+    path = os.path.join(tempfile.gettempdir(), "pcmx_fake.ifs")
+    with open(path, "wb") as f:                    # QNX startup magic marks an IFS1
+        f.write(struct.pack("<I", QNX_STARTUP_MAGIC) + bytes(0x80))
+    try:
+        check("looks_like_ifs() accepts a QNX startup header", looks_like_ifs(path))
+    finally:
+        os.remove(path)
+    junk = os.path.join(tempfile.gettempdir(), "pcmx_notfw.bin")
+    with open(junk, "wb") as f:
+        f.write(bytes(0x80))
+    try:
+        check("looks_like_ifs() rejects a non-.ifs blob", not looks_like_ifs(junk))
+    finally:
+        os.remove(junk)
+    check("IFS2 payload starts at 0x40", IFS2_LZO_OFFSET == 0x40)
+
+
+
 def test_real_image_if_present():
     """Runs the full filesystem self-test if a real image happens to be around."""
     path = os.environ.get("PCM_TEST_IMAGE")
@@ -160,6 +207,8 @@ def main():
     test_no_mbr()
     test_helpers()
     test_rootnode()
+    test_decoders()
+    test_firmware_detect()
     test_real_image_if_present()
     print("\n%s" % ("ALL PASSED" if not _fails
                     else "FAILED: " + ", ".join(_fails)))

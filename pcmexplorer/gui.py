@@ -7,11 +7,16 @@ from tkinter import ttk, filedialog, messagebox
 
 from .core import (DiskImage, build_paths, hexdump, human, is_dir, is_link,
                    mode_str, NIL)
+from .decode import preview, summarise_disk, summarise_firmware
+from .firmware import FirmwareImage, looks_like_ifs
 
 BG, PANEL, LINE = "#14161a", "#1b1e24", "#2b3038"
 TEXT, DIM, ACCENT = "#dfe3ea", "#8b93a1", "#d2a24c"
 
-OPEN_TYPES = [("Disk images", "*.img *.dd *.raw *.bin"), ("All files", "*.*")]
+OPEN_TYPES = [("Head-unit images", "*.img *.dd *.raw *.bin *.ifs"),
+              ("Disk images", "*.img *.dd *.raw *.bin"),
+              ("Firmware images", "*.ifs"),
+              ("All files", "*.*")]
 PREVIEW_BYTES = 4096
 
 
@@ -29,7 +34,8 @@ class Explorer(tk.Tk):
         self.geometry("1200x780")
         self.configure(bg=BG)
         self.img = None
-        self.fs = None            # QNX6FS when the partition mounts
+        self.fw = None            # FirmwareImage when a .ifs is open
+        self.fs = None            # QNX6FS/QNX4FS when the partition mounts
         self.nodes = {}           # tree item id -> inode dict
         self.salvage = {}         # fallback directory map
         self.cur_part = None
@@ -102,6 +108,7 @@ class Explorer(tk.Tk):
         ttk.Button(bar, text="Extract folder...", command=self.extract_dir).pack(side="left", padx=6)
         ttk.Button(bar, text="Export listing...", command=self.export_tree).pack(side="left")
         ttk.Button(bar, text="Verify", command=self.verify).pack(side="left", padx=6)
+        ttk.Button(bar, text="Summary", command=self.show_summary).pack(side="left")
         ttk.Label(right, text="Content").pack(anchor="w")
         self.hexv = tk.Text(right, bg=PANEL, fg=TEXT, bd=0, wrap="none",
                             insertbackground=TEXT, font=("Consolas", 9))
@@ -123,10 +130,30 @@ class Explorer(tk.Tk):
             self.load(p)
 
     def load(self, path):
+        # A firmware image (.ifs) is a different container that browses the same way.
+        if looks_like_ifs(path):
+            try:
+                fw = FirmwareImage(path)
+            except Exception as e:
+                messagebox.showerror("Could not open firmware image", str(e))
+                return
+            if self.img:
+                self.img.close()
+            self.img, self.fw, self.fs = None, fw, None
+            self.lbl.config(text="%s   %s" % (os.path.basename(path), fw.describe()))
+            self.plist.delete(*self.plist.get_children())
+            self.plist.insert("", "end", iid="IFS", text="IFS",
+                              values=(fw.container, human(len(fw.data)), "imagefs"))
+            self._fill_firmware(fw)
+            self.info.delete("1.0", "end")
+            self.info.insert("end", summarise_firmware(fw))
+            self.set_status("Firmware image - %d entries. Read-only." % len(fw.entries()))
+            return
         try:
             if self.img:
                 self.img.close()
             self.img = DiskImage(path)
+            self.fw = None
         except Exception as e:
             messagebox.showerror("Could not open image", str(e))
             return
@@ -143,6 +170,40 @@ class Explorer(tk.Tk):
                               values=(p["type_name"], human(p["length"]), fs))
         self.set_status("%d partitions — select one to open it."
                         % len(self.img.parts))
+
+    def _fill_firmware(self, fw):
+        """Firmware dirents carry full paths, so rebuild folders for display."""
+        self.tree.delete(*self.tree.get_children())
+        self.nodes = {}
+        folders = {"": ""}
+        for pth, ent in sorted(fw.entries()):
+            parts = [x for x in pth.split("/") if x]
+            if not parts:
+                continue
+            parent, walked = "", ""
+            for seg in parts[:-1]:
+                walked += "/" + seg
+                if walked not in folders:
+                    folders[walked] = self.tree.insert(parent, "end", text=seg + "/",
+                                                       values=("", ""))
+                parent = folders[walked]
+            label = parts[-1] + ("@" if is_link(ent) else "")
+            size = "" if is_dir(ent) else human(ent["size"])
+            iid = self.tree.insert(parent, "end", text=label, values=(size, ent["ino"]))
+            self.nodes[iid] = ent
+
+    def show_summary(self):
+        """Answer 'what is this image?' rather than just listing files."""
+        self.info.delete("1.0", "end")
+        try:
+            if self.fw:
+                self.info.insert("end", summarise_firmware(self.fw))
+            elif self.img:
+                self.set_status("Building summary...")
+                self.info.insert("end", summarise_disk(self.img))
+                self.set_status("Summary ready.")
+        except Exception as e:
+            self.info.insert("end", "summary failed: %s" % e)
 
     # -- partition selected --
     def on_part(self, _evt=None):
@@ -284,23 +345,30 @@ class Explorer(tk.Tk):
                          % (inode["levels"], inode["uid"], inode["gid"]))
         if is_link(inode):
             try:
-                self.info.insert("end", "target %s\n" % self.fs.link_target(inode))
+                self.info.insert("end", "target %s\n" % (self.fw or self.fs).link_target(inode))
             except Exception:
                 pass
             return
         if is_dir(inode):
             try:
-                kids = self.fs.dirents(inode)
+                kids = (self.fw or self.fs).dirents(inode)
                 self.info.insert("end", "%d entries\n" % len(kids))
             except Exception:
                 pass
             return
         try:
-            data = self.fs.read_range(inode, 0, PREVIEW_BYTES)
+            data = (self.fw or self.fs).read_range(inode, 0, PREVIEW_BYTES)
         except Exception as e:
             self.hexv.insert("end", "read failed: %s" % e)
             return
-        if _printable_ratio(data[:512]) > 0.9:
+        txt = None
+        try:
+            txt = preview(self._path_of(iid), data)
+        except Exception:
+            txt = None
+        if txt is not None:
+            self.hexv.insert("end", txt)
+        elif _printable_ratio(data[:512]) > 0.9:
             self.hexv.insert("end", data.decode("latin-1"))
         else:
             self.hexv.insert("end", hexdump(data, 0))
@@ -308,7 +376,7 @@ class Explorer(tk.Tk):
     # -- actions --
     def extract(self):
         iid, inode, name = self._sel()
-        if inode is None or not self.fs:
+        if inode is None or not (self.fw or self.fs):
             messagebox.showinfo("Cannot extract",
                                 "Select a file in a filesystem that opened cleanly.")
             return
@@ -318,7 +386,7 @@ class Explorer(tk.Tk):
         if not dest:
             return
         try:
-            data = self.fs.read_file(inode)
+            data = (self.fw or self.fs).read_file(inode)
             with open(dest, "wb") as fh:
                 fh.write(data)
         except Exception as e:
@@ -386,6 +454,12 @@ class Explorer(tk.Tk):
         self.set_status("Wrote %s (%d lines)" % (dest, len(lines)))
 
     def verify(self):
+        if self.fw:
+            res = self.fw.verify()
+            txt = "\n".join("[%s] %-18s %s" % ("PASS" if ok else "FAIL", n, d)
+                            for n, ok, d in res)
+            messagebox.showinfo("Firmware verification", txt)
+            return
         if not self.fs:
             messagebox.showinfo("Verify", "This partition did not open as QNX6.")
             return

@@ -11,16 +11,27 @@ drive, you get a 40 GB file that nothing will open.
 This opens it.
 
 ```
-python explorer.py                                   # desktop UI
-python explorer.py disk.img                          # partitions + filesystem detection
-python explorer.py disk.img ls P2                    # list every file
+python explorer.py                                    # desktop UI
+python explorer.py disk.img                           # summary -- what IS this image?
+python explorer.py disk.img ls P2                     # list every file
 python explorer.py disk.img cat P2 /HBdata/version.txt
-python explorer.py disk.img extract P2 /Browser ./out # pull a file or a whole folder
-python explorer.py disk.img verify P2                # filesystem self-test
+python explorer.py disk.img extract P2 /Browser ./out  # a file or a whole folder
+python explorer.py disk.img verify P2                 # filesystem self-test
+
+python explorer.py PCM3_IFS1.ifs                      # firmware images too
+python explorer.py PCM3_IFS2.ifs ls /mnt/ifs_app/HBproject
 ```
 
 ## What it does
 
+- **Tells you what an image *is*.** Not just a file list: drive variant, navigation
+  packages, speech version, odometer, and — for firmware — the build string and whether
+  that release supports a jukebox at all.
+- **Opens firmware as well as drives.** `PCM3_IFS1.ifs` and `PCM3_IFS2.ifs` from an
+  official update package browse exactly like a disk, so "does this release contain X"
+  is a directory listing rather than a reverse-engineering session.
+- **Decodes what it finds** — `CVALUE*.CVA` coding tables, the odometer inside the
+  driver's-logbook database, ELF architecture, PNG dimensions.
 - **Maps the partitions** and identifies the filesystem in each — **QNX6 and QNX4** — reading
   real geometry (block size, inode counts, allocation groups) from the QNX6 superblock.
 - **Lists every file and folder**, with sizes, permissions and inode numbers.
@@ -50,6 +61,31 @@ chunk CRC on the drive (970/970), ELF section tables on all 47 binaries (several
 *exactly* at EOF, which proves the last block of a multi-level file map is correct),
 `PRAGMA integrity_check` on the SQLite databases, and the ISO9660 descriptor of a 387 MB
 image read correctly through two levels of indirection.
+
+## Firmware images
+
+An update package carries two compressed images, and both open here:
+
+| | container | holds |
+|---|---|---|
+| `PCM3_IFS1.ifs` | QNX boot image, chunked LZO1X | the OS, `PCM3Root`, drivers, `hddmounter` |
+| `PCM3_IFS2.ifs` | a single LZO1X stream at offset `0x40` | the HMI — `PCM3Reload`, `NavCore` |
+
+Decompression is pure Python (the decoder is vendored in-tree), so reading firmware needs
+no `liblzo2`, no compiler and no `python-lzo`.
+
+The summary answers the question people actually have:
+
+```
+Firmware image: PCM3_IFS1.ifs
+  IFS1 container, 18.1 MB inflated, 177 files / 1 dirs / 52 symlinks
+
+/mnt/ifs1/HBproject/version.txt:
+  Porsche_PCM3.1_MOPF_SOP_STEP9.6_15245AS9
+
+Jukebox support: YES (7 references to /mnt/media)
+hddmounter present: yes
+```
 
 ## Salvage mode
 
