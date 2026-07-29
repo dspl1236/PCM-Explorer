@@ -57,8 +57,30 @@ class Explorer(tk.Tk):
 
         self._style()
         self._build()
+        self._wheel()
         if initial:
             self.load(initial)
+
+    def _wheel(self):
+        """Scroll whatever is under the pointer, not whatever has focus.
+
+        Tk sends the wheel to the focused widget, so hovering a pane and
+        scrolling does nothing until you click it first -- which is not how
+        anyone expects a file browser to behave.
+        """
+        def on_wheel(ev):
+            w = self.winfo_containing(ev.x_root, ev.y_root)
+            while w is not None:
+                if hasattr(w, "yview_scroll"):
+                    w.yview_scroll(-1 if ev.delta > 0 else 1, "units")
+                    return "break"
+                w = getattr(w, "master", None)
+            return None
+        self.bind_all("<MouseWheel>", on_wheel)          # Windows / macOS
+        self.bind_all("<Button-4>", lambda e: on_wheel(type("E", (), {
+            "x_root": e.x_root, "y_root": e.y_root, "delta": 120})))
+        self.bind_all("<Button-5>", lambda e: on_wheel(type("E", (), {
+            "x_root": e.x_root, "y_root": e.y_root, "delta": -120})))
 
     # -- chrome --
     def _style(self):
@@ -91,6 +113,29 @@ class Explorer(tk.Tk):
         st.configure("Horizontal.TScrollbar", background=LINE, troughcolor=BG,
                      borderwidth=0, arrowcolor=DIM)
 
+    @staticmethod
+    def _scrolled(parent, make, horizontal=False, **pack_kw):
+        """Put a widget in a frame with scrollbars and return the widget.
+
+        Everything here can outgrow its pane -- a disc has thousands of files,
+        a module's FILES block runs to hundreds of lines -- so nothing is
+        usefully scrollable by wheel alone: you cannot see how far down you are.
+        """
+        box = ttk.Frame(parent)
+        w = make(box)
+        vs = ttk.Scrollbar(box, orient="vertical", command=w.yview)
+        w.configure(yscrollcommand=vs.set)
+        w.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        if horizontal:
+            hs = ttk.Scrollbar(box, orient="horizontal", command=w.xview)
+            w.configure(xscrollcommand=hs.set)
+            hs.grid(row=1, column=0, sticky="ew")
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+        box.pack(**pack_kw)
+        return w
+
     def _build(self):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=8, pady=8)
@@ -107,33 +152,39 @@ class Explorer(tk.Tk):
 
         left = ttk.Frame(pan)
         ttk.Label(left, text="Partitions", style="Title.TLabel").pack(anchor="w")
-        self.plist = ttk.Treeview(left, columns=("type", "size", "fs"),
-                                  show="tree headings", height=5)
+        self.plist = self._scrolled(
+            left,
+            lambda b: ttk.Treeview(b, columns=("type", "size", "fs"),
+                                   show="tree headings", height=6),
+            fill="x")
         self.plist.heading("#0", text="part")
         self.plist.column("#0", width=55)
         for c, w in (("type", 80), ("size", 85), ("fs", 165)):
             self.plist.heading(c, text=c)
             self.plist.column(c, width=w)
-        self.plist.pack(fill="x")
         self.plist.bind("<<TreeviewSelect>>", self.on_part)
 
         ttk.Label(left, text="Files", style="Title.TLabel").pack(anchor="w", pady=(10, 0))
-        self.tree = ttk.Treeview(left, columns=("size", "ino"), show="tree headings")
+        self.tree = self._scrolled(
+            left,
+            lambda b: ttk.Treeview(b, columns=("size", "ino"), show="tree headings"),
+            horizontal=True, fill="both", expand=True)
         self.tree.heading("#0", text="name")
         self.tree.column("#0", width=300)
         self.tree.heading("size", text="size")
         self.tree.column("size", width=90, anchor="e")
         self.tree.heading("ino", text="inode")
         self.tree.column("ino", width=65, anchor="e")
-        self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self.on_node)
         pan.add(left, weight=3)
 
         right = ttk.Frame(pan)
         ttk.Label(right, text="Details", style="Title.TLabel").pack(anchor="w")
-        self.info = tk.Text(right, height=9, bg=PANEL, fg=TEXT, bd=0,
-                            insertbackground=TEXT, font=("Consolas", 9))
-        self.info.pack(fill="x")
+        self.info = self._scrolled(
+            right,
+            lambda b: tk.Text(b, height=10, bg=PANEL, fg=TEXT, bd=0,
+                              insertbackground=TEXT, font=("Consolas", 9)),
+            fill="x")
         bar = ttk.Frame(right)
         bar.pack(fill="x", pady=6)
         ttk.Button(bar, text="Extract file...", command=self.extract).pack(side="left")
@@ -142,9 +193,12 @@ class Explorer(tk.Tk):
         ttk.Button(bar, text="Verify", command=self.verify).pack(side="left", padx=6)
         ttk.Button(bar, text="Summary", command=self.show_summary).pack(side="left")
         ttk.Label(right, text="Content", style="Title.TLabel").pack(anchor="w")
-        self.hexv = tk.Text(right, bg=PANEL, fg=TEXT, bd=0, wrap="none",
-                            insertbackground=TEXT, font=("Consolas", 9))
-        self.hexv.pack(fill="both", expand=True)
+        # wrap="none" so a hex dump keeps its columns -- hence a horizontal bar
+        self.hexv = self._scrolled(
+            right,
+            lambda b: tk.Text(b, bg=PANEL, fg=TEXT, bd=0, wrap="none",
+                              insertbackground=TEXT, font=("Consolas", 9)),
+            horizontal=True, fill="both", expand=True)
         pan.add(right, weight=4)
 
         self.status = tk.StringVar(value="Read-only — the image is never modified.")
