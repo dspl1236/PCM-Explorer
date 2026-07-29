@@ -177,7 +177,11 @@ class Explorer(tk.Tk):
         if self.img:
             self.img.close()
         self.img, self.fw, self.fs, self.disc = None, None, None, disc
-        self.lbl.config(text="%s   update disc" % os.path.basename(path.rstrip("/\\")))
+        # say which folder it actually opened -- selecting a release inside a
+        # disc resolves up to the disc, and silently doing so would confuse
+        shown = disc.root or path
+        self.lbl.config(text="%s   update disc"
+                        % os.path.basename(str(shown).rstrip("/\\")))
         self.plist.delete(*self.plist.get_children())
         defs = disc.definitions()
         for dpath in sorted(defs):
@@ -291,6 +295,18 @@ class Explorer(tk.Tk):
             return
         self.disc = None
         self.hmi = None
+        # A folder that nothing recognised must not fall through to DiskImage --
+        # it would try to read a directory as a file and report a bare OS error.
+        if os.path.isdir(path):
+            messagebox.showerror(
+                "Not something PCM Explorer can open",
+                "%s is a folder, but it does not look like an update disc.\n\n"
+                "Open the disc's top folder (the one holding HBUPDATE.DEF or\n"
+                "pcm_update.disc), or a release folder inside it.\n\n"
+                "For a drive, firmware, persistence or HMI file, use\n"
+                "\"Open image...\" and pick the file itself."
+                % os.path.basename(path.rstrip("/\\")))
+            return
         if looks_like_hbm5(path):
             self._load_hmi(path)
             return

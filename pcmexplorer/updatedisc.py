@@ -217,7 +217,8 @@ class UpdateDisc(object):
         self.root = None
         self._filelist = None
         if os.path.isdir(path):
-            self.root = path
+            # open the disc, not whichever folder inside it was selected
+            self.root = disc_root(path) or path
         else:
             self.iso = Iso9660(path)
 
@@ -365,13 +366,41 @@ class UpdateDisc(object):
         return out
 
 
+def disc_root(path):
+    """The disc root for a folder, or None.
+
+    People open the folder they are looking at, which is often one release
+    inside a disc (``PCM31RDW400``) or the module folder below it -- so accept
+    a release tree by its ``HEADUNIT`` directory, and walk up a couple of
+    levels to find the definitions rather than refusing.
+    """
+    if not os.path.isdir(path):
+        return None
+    here = os.path.abspath(path)
+    fallback = None
+    for _ in range(3):
+        try:
+            names = set(os.listdir(here))
+        except OSError:
+            break
+        # a folder carrying the definitions is the real root: prefer it, since
+        # units/modules/crc all need them, and keep looking up for one
+        if DISC_MARKER in names or any(n.lower().endswith(".def") for n in names):
+            return here
+        if fallback is None and ("HEADUNIT" in names or "headunit" in names):
+            fallback = here        # a release tree -- real content, no defs
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+    return fallback
+
+
 def looks_like_update_disc(path):
     """Cheap probe: is this an update disc (ISO or extracted tree)?"""
     try:
         if os.path.isdir(path):
-            names = set(os.listdir(path))
-            return (DISC_MARKER in names
-                    or any(n.lower().endswith(".def") for n in names))
+            return disc_root(path) is not None
         if not os.path.isfile(path):
             return False
         if os.path.getsize(path) < PVD_SECTOR * SECTOR + SECTOR:

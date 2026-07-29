@@ -21,7 +21,8 @@ from pcmexplorer.hbm5 import Hbm5File, looks_like_hbm5, read_varint
 from pcmexplorer.hbm5geom import (ANCHOR_KINDS, DISPLAY_H, DISPLAY_W,
                                   _varint as _gvarint)
 from pcmexplorer.diffimg import compare, format_report, open_side
-from pcmexplorer.updatedisc import (FLASH_MAP, UpdateDisc, looks_like_update_disc,
+from pcmexplorer.updatedisc import (FLASH_MAP, UpdateDisc, disc_root,
+                                    looks_like_update_disc,
                                     parse_crc_record, parse_def, signature_kind,
                                     summarise_update)
 
@@ -267,6 +268,16 @@ CONTROL
                     "      UPDATE PCM31APP0115245A;\n   ENDUPDATE;\n};\n")
         check("looks_like_update_disc() accepts an extracted folder",
               looks_like_update_disc(d))
+        # People open the folder they are looking at, which is often one level
+        # inside the disc -- that must resolve up, not error.
+        inner = os.path.join(d, "PCM31RDW400", "HEADUNIT")
+        os.makedirs(inner, exist_ok=True)
+        check("a release folder resolves up to the disc",
+              disc_root(os.path.join(d, "PCM31RDW400")) == os.path.abspath(d),
+              str(disc_root(os.path.join(d, "PCM31RDW400"))))
+        check("a folder deeper in still resolves", looks_like_update_disc(inner))
+        check("an unrelated folder is not a disc",
+              not looks_like_update_disc(tempfile.gettempdir()))
         with UpdateDisc(d) as disc:
             check("UpdateDisc.files() lists the folder", len(disc.files()) == 1)
             defs = disc.definitions()
