@@ -9,6 +9,7 @@ from .core import (DiskImage, build_paths, hexdump, human, is_dir, is_link,
 from .decode import preview, summarise_disk, summarise_firmware
 from .firmware import FirmwareImage, looks_like_ifs
 from .efs import EfsImage, looks_like_efs, summarise_efs
+from .hbm5 import Hbm5File, looks_like_hbm5, summarise_hbm5
 from .updatedisc import UpdateDisc, looks_like_update_disc, summarise_update
 
 USAGE = """PCM Explorer -- browse a Porsche PCM / Audi MMI hard-drive image.
@@ -37,6 +38,13 @@ Update discs (a .ISO, or an already-extracted disc folder):
 
 Persistence images (PCM3_HBpersistence.efs and MMI efs-system.efs) open the
 same way -- summary, ls, cat, extract.
+
+HMI definitions (.mmi) hold the screens and every string the unit can display:
+
+  pcm-explorer <x.mmi>                      what is in this HMI file
+  pcm-explorer <x.mmi> strings [pattern]    every readable string, with its id
+  pcm-explorer <x.mmi> langs [pattern]      keys resolved across all languages
+  pcm-explorer <x.mmi> verify               container self-check
 
 Compare any two of the above:
 
@@ -354,6 +362,61 @@ def _disc_cmd(disc, cmd, a):
     return 1
 
 
+def _hbm5_cmd(m, cmd, a):
+    """HMI-definition subcommands."""
+    if cmd in ("summary", "parts"):
+        print(summarise_hbm5(m))
+        return 0
+
+    if cmd == "verify":
+        bad = 0
+        for label, ok, detail in m.verify():
+            print("  [%s] %-32s %s" % ("PASS" if ok else "FAIL", label, detail))
+            bad += 0 if ok else 1
+        print("\n%s" % ("container consistent" if not bad else "%d checks failed" % bad))
+        return 1 if bad else 0
+
+    if cmd in ("strings", "ls"):
+        pat = a[0].lower() if a else None
+        strs = m.strings()
+        n = 0
+        for rid in sorted(strs):
+            t = strs[rid]
+            if pat and pat not in t.lower():
+                continue
+            print("  %-8d %s" % (rid, t.replace("\n", "\\n")))
+            n += 1
+        print("\n%d string%s" % (n, "" if n == 1 else "s"))
+        comp = m.compressed_ids()
+        if comp:
+            print("%d further payloads are LZRW-compressed and not decoded." % len(comp))
+        return 0
+
+    if cmd in ("langs", "translations"):
+        want = a[0].lower() if a else None
+        rows = [r for r in m.translations() if len(r[1]) > 1]
+        if not rows:
+            print("no multi-language keys in this file")
+            return 1
+        shown = 0
+        for did, row in rows:
+            if want and not any(want in v.lower() for v in row.values()):
+                continue
+            print("  key %d" % did)
+            for k in sorted(row):
+                print("      %-6s %s" % (k, row[k].replace("\n", "\\n")))
+            shown += 1
+        if want:
+            print("\n%d of %d translated keys match %r" % (shown, len(rows), a[0]))
+        else:
+            print("\n%d translated key%s" % (shown, "" if shown == 1 else "s"))
+        return 0
+
+    print("unknown HMI command: %s" % cmd)
+    print("try: summary, verify, strings, langs")
+    return 1
+
+
 def cmd_diff(argv):
     """Compare two readable things and report what differs."""
     from .diffimg import compare, format_report, open_side
@@ -400,6 +463,15 @@ def main(argv):
         from .gui import run
         run(path)
         return 0
+
+    # An HMI definition (.mmi) -- screens and every string the unit can show.
+    if looks_like_hbm5(path):
+        try:
+            m = Hbm5File(path)
+        except Exception as e:
+            print("not a readable HMI definition: %s" % e)
+            return 1
+        return _hbm5_cmd(m, cmd, argv[2:])
 
     # An update disc -- an ISO, or a folder it was extracted to.
     if looks_like_update_disc(path):

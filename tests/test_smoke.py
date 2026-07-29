@@ -17,6 +17,7 @@ from pcmexplorer.core import (DiskImage, RootNode, hexdump, human, mode_str,
 from pcmexplorer.decode import decode_cvalue, preview, odometer_from_logbook
 from pcmexplorer.firmware import looks_like_ifs, QNX_STARTUP_MAGIC, IFS2_LZO_OFFSET
 from pcmexplorer.efs import EfsImage, looks_like_efs
+from pcmexplorer.hbm5 import Hbm5File, looks_like_hbm5, read_varint
 from pcmexplorer.diffimg import compare, format_report, open_side
 from pcmexplorer.updatedisc import (FLASH_MAP, UpdateDisc, looks_like_update_disc,
                                     parse_crc_record, parse_def, signature_kind,
@@ -341,6 +342,81 @@ def test_diff():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _hbm5_varint(n):
+    if n < 0x80:
+        return bytes([n])
+    if n < 0x4000:
+        return bytes([0x80 | (n >> 8), n & 0xFF])
+    return bytes([0xC0 | (n >> 16), (n >> 8) & 0xFF, n & 0xFF])
+
+
+def test_hbm5():
+    print("\nHBM5 HMI definitions")
+    check("varint: 1-byte form", read_varint(b"\x05", 0) == (5, 1))
+    check("varint: 2-byte form is 14-bit",
+          read_varint(b"\x81\x00", 0) == (256, 2), str(read_varint(b"\x81\x00", 0)))
+    # the real case that pinned the encoding: c2 6e ea -> 159,466
+    check("varint: 3-byte form", read_varint(b"\xc2\x6e\xea", 0) == (159466, 3),
+          str(read_varint(b"\xc2\x6e\xea", 0)))
+
+    # Build a minimal but structurally valid file: one descriptor pointing at two
+    # payloads, which is the shape every translated key has.
+    texts = ["Aktuelles Ziel", "Current destination"]
+    pool = b""
+    offs = []
+    for t in texts:
+        offs.append(len(pool))
+        raw = t.encode("utf-8")
+        pool += _hbm5_varint(len(raw)) + raw
+    desc = struct.pack("<II", 0, 2) + struct.pack("<II", 1, 10) + \
+        struct.pack("<II", 3, 11)
+
+    n_dir = 3
+    hdr_and_dir = 0x28 + 12 * n_dir
+    desc_off = hdr_and_dir
+    pool_off = desc_off + len(desc)
+    body = desc + pool
+    size = pool_off + len(pool)
+
+    def ent(rid, off, is_desc, blocklen):
+        b0 = (0 << 4) | (1 if is_desc else 0)
+        units = ((blocklen + 15) // 16) & 0xFF
+        return struct.pack("<II", rid, off) + bytes([b0, 0, units, 0])
+
+    d = bytearray()
+    d += b"HBM5" + struct.pack("<HH", 0x0100, 1)
+    d += struct.pack("<8I", hdr_and_dir, hdr_and_dir, 0x28, size, n_dir, 0x28,
+                     pool_off - 0x28, 1)
+    lens = [len(desc), len(pool) - offs[1], 0]
+    d += ent(9, desc_off, True, len(desc))
+    d += ent(10, pool_off + offs[0], False, offs[1] - offs[0])
+    d += ent(11, pool_off + offs[1], False, len(pool) - offs[1])
+    d += body
+
+    path = os.path.join(tempfile.gettempdir(), "pcmx_fake.mmi")
+    with open(path, "wb") as f:
+        f.write(bytes(d))
+    try:
+        check("looks_like_hbm5() accepts the magic", looks_like_hbm5(path))
+        m = Hbm5File(path)
+        checks = dict((n, ok) for n, ok, _x in m.verify())
+        check("container self-check passes", all(checks.values()), str(checks))
+        strs = m.strings()
+        check("strings decode as UTF-8",
+              sorted(strs.values()) == sorted(texts), str(strs))
+        desc_map = m.descriptors()
+        check("descriptor parsed", desc_map.get(9) == [(1, 10), (3, 11)],
+              str(desc_map))
+        tr = m.translations()
+        check("languages resolved via descriptor",
+              tr and tr[0][1] == {"de": "Aktuelles Ziel",
+                                  "en_us": "Current destination"}, str(tr))
+    finally:
+        os.remove(path)
+    check("looks_like_hbm5() rejects a non-HBM5",
+          not looks_like_hbm5(os.path.join(tempfile.gettempdir(), "pcmx_nope.mmi")))
+
+
 def test_version():
     print("\nversion reporting")
     import pcmexplorer
@@ -380,6 +456,7 @@ def main():
     test_update_disc()
     test_efs_detect()
     test_diff()
+    test_hbm5()
     test_version()
     test_real_image_if_present()
     print("\n%s" % ("ALL PASSED" if not _fails

@@ -24,6 +24,12 @@ python explorer.py PCM3_IFS2.ifs ls /mnt/ifs_app/HBproject
 python explorer.py PCM_NA_20150721.ISO                # and update discs
 python explorer.py update.iso units                   # which head units accept it
 python explorer.py update.iso crc                     # verify every payload
+
+python explorer.py PCM3_HBpersistence.efs             # factory persistence flash
+python explorer.py cayenne.mmi langs                  # the HMI, in every language
+
+python explorer.py diff old.ifs new.ifs               # what changed between builds
+python explorer.py diff ./car_hbp PCM3_HBpersistence.efs   # a car vs the factory
 ```
 
 ## What it does
@@ -37,6 +43,14 @@ python explorer.py update.iso crc                     # verify every payload
 - **Reads update discs** — a `.ISO` directly, no extraction needed, or a folder you
   already extracted. Tells you which head units a disc will actually install on, what
   each module writes and where in flash, and verifies every CRC32 against its payload.
+- **Opens the persistence flash** (`PCM3_HBpersistence.efs`, and MMI `efs-system.efs`)
+  — the factory contents of `/HBpersistence`, which is the baseline to compare a real
+  car against.
+- **Reads the HMI itself.** The PCM interface is not compiled in; it is data, in
+  `.mmi` files. Every screen string the unit can display, in all nine languages —
+  ten on the instrument cluster, which is the only place Chinese appears.
+- **Compares any two of them.** `diff` works across kinds: two firmware builds, or a
+  car's exported `/HBpersistence` folder against the factory flash image.
 - **Decodes what it finds** — `CVALUE*.CVA` coding tables, the odometer inside the
   driver's-logbook database, ELF architecture, PNG dimensions.
 - **Maps the partitions** and identifies the filesystem in each — **QNX6 and QNX4** — reading

@@ -11,15 +11,23 @@ from .core import (DiskImage, build_paths, hexdump, human, is_dir, is_link,
                    mode_str, NIL)
 from .decode import preview, summarise_disk, summarise_firmware
 from .firmware import FirmwareImage, looks_like_ifs
+from .efs import EfsImage, looks_like_efs, summarise_efs
+from .hbm5 import Hbm5File, looks_like_hbm5, summarise_hbm5
 from .updatedisc import UpdateDisc, looks_like_update_disc, summarise_update
 
-BG, PANEL, LINE = "#14161a", "#1b1e24", "#2b3038"
-TEXT, DIM, ACCENT = "#dfe3ea", "#8b93a1", "#d2a24c"
+# Palette shared with PCM-Forge (docs/index.html :root), so the desktop tool and
+# the web toolkit read as one project.
+BG, PANEL, LINE = "#0a0a0c", "#131318", "#2a2a35"
+PANEL2 = "#1a1a22"
+TEXT, DIM, ACCENT = "#e8e8ed", "#8888a0", "#c8a44e"
+ACCENT2, GREEN, RED = "#e8c85e", "#4eca7a", "#e85454"
 
-OPEN_TYPES = [("Head-unit images", "*.img *.dd *.raw *.bin *.ifs *.iso"),
+OPEN_TYPES = [("Head-unit images", "*.img *.dd *.raw *.bin *.ifs *.iso *.efs *.mmi"),
               ("Disk images", "*.img *.dd *.raw *.bin"),
               ("Firmware images", "*.ifs"),
               ("Update discs", "*.iso"),
+              ("Persistence images", "*.efs"),
+              ("HMI definitions", "*.mmi"),
               ("All files", "*.*")]
 PREVIEW_BYTES = 4096
 
@@ -40,6 +48,7 @@ class Explorer(tk.Tk):
         self.img = None
         self.fw = None            # FirmwareImage when a .ifs is open
         self.disc = None          # UpdateDisc when an .iso / disc folder is open
+        self.hmi = None           # Hbm5File when a .mmi is open
         self.fs = None            # QNX6FS/QNX4FS when the partition mounts
         self.nodes = {}           # tree item id -> inode dict
         self.salvage = {}         # fallback directory map
@@ -62,11 +71,25 @@ class Explorer(tk.Tk):
         st.configure("TFrame", background=BG)
         st.configure("TLabel", background=BG, foreground=TEXT)
         st.configure("Dim.TLabel", foreground=DIM)
+        # PCM-Forge marks section titles in gold monospace; echo that here.
+        st.configure("Title.TLabel", foreground=ACCENT,
+                     font=("Consolas", 9, "bold"))
         st.configure("Treeview", background=PANEL, fieldbackground=PANEL,
-                     foreground=TEXT, rowheight=20, borderwidth=0)
-        st.configure("Treeview.Heading", background=LINE, foreground=TEXT)
+                     foreground=TEXT, rowheight=21, borderwidth=0)
+        st.configure("Treeview.Heading", background=PANEL2, foreground=DIM,
+                     borderwidth=0, font=("Consolas", 9))
         st.map("Treeview", background=[("selected", ACCENT)],
-               foreground=[("selected", "#000000")])
+               foreground=[("selected", BG)])
+        st.configure("TButton", background=PANEL2, foreground=TEXT,
+                     borderwidth=1, focusthickness=0, padding=(10, 5))
+        st.map("TButton",
+               background=[("active", LINE), ("pressed", ACCENT)],
+               foreground=[("pressed", BG)])
+        st.configure("TPanedwindow", background=BG)
+        st.configure("Vertical.TScrollbar", background=LINE, troughcolor=BG,
+                     borderwidth=0, arrowcolor=DIM)
+        st.configure("Horizontal.TScrollbar", background=LINE, troughcolor=BG,
+                     borderwidth=0, arrowcolor=DIM)
 
     def _build(self):
         top = ttk.Frame(self)
@@ -83,7 +106,7 @@ class Explorer(tk.Tk):
         pan.pack(fill="both", expand=True, padx=8)
 
         left = ttk.Frame(pan)
-        ttk.Label(left, text="Partitions").pack(anchor="w")
+        ttk.Label(left, text="Partitions", style="Title.TLabel").pack(anchor="w")
         self.plist = ttk.Treeview(left, columns=("type", "size", "fs"),
                                   show="tree headings", height=5)
         self.plist.heading("#0", text="part")
@@ -94,7 +117,7 @@ class Explorer(tk.Tk):
         self.plist.pack(fill="x")
         self.plist.bind("<<TreeviewSelect>>", self.on_part)
 
-        ttk.Label(left, text="Files").pack(anchor="w", pady=(10, 0))
+        ttk.Label(left, text="Files", style="Title.TLabel").pack(anchor="w", pady=(10, 0))
         self.tree = ttk.Treeview(left, columns=("size", "ino"), show="tree headings")
         self.tree.heading("#0", text="name")
         self.tree.column("#0", width=300)
@@ -107,7 +130,7 @@ class Explorer(tk.Tk):
         pan.add(left, weight=3)
 
         right = ttk.Frame(pan)
-        ttk.Label(right, text="Details").pack(anchor="w")
+        ttk.Label(right, text="Details", style="Title.TLabel").pack(anchor="w")
         self.info = tk.Text(right, height=9, bg=PANEL, fg=TEXT, bd=0,
                             insertbackground=TEXT, font=("Consolas", 9))
         self.info.pack(fill="x")
@@ -118,14 +141,14 @@ class Explorer(tk.Tk):
         ttk.Button(bar, text="Export listing...", command=self.export_tree).pack(side="left")
         ttk.Button(bar, text="Verify", command=self.verify).pack(side="left", padx=6)
         ttk.Button(bar, text="Summary", command=self.show_summary).pack(side="left")
-        ttk.Label(right, text="Content").pack(anchor="w")
+        ttk.Label(right, text="Content", style="Title.TLabel").pack(anchor="w")
         self.hexv = tk.Text(right, bg=PANEL, fg=TEXT, bd=0, wrap="none",
                             insertbackground=TEXT, font=("Consolas", 9))
         self.hexv.pack(fill="both", expand=True)
         pan.add(right, weight=4)
 
         self.status = tk.StringVar(value="Read-only — the image is never modified.")
-        tk.Label(self, textvariable=self.status, bg=PANEL, fg=DIM, anchor="w",
+        tk.Label(self, textvariable=self.status, bg=PANEL2, fg=DIM, anchor="w",
                  padx=8, pady=4).pack(fill="x", side="bottom")
 
     def set_status(self, s):
@@ -220,6 +243,46 @@ class Explorer(tk.Tk):
                                    values=(human(sz) if sz is not None else "", ""))
             self.nodes[iid] = {"_disc_path": pth, "size": sz or 0}
 
+    def _load_hmi(self, path):
+        """An HMI definition: screens and every string the unit can display."""
+        try:
+            m = Hbm5File(path)
+        except Exception as e:
+            messagebox.showerror("Could not open HMI definition", str(e))
+            return
+        if self.img:
+            self.img.close()
+        self.img, self.fw, self.fs, self.disc = None, None, None, None
+        self.hmi = m
+        self.lbl.config(text="%s   %s" % (os.path.basename(path), m.describe()))
+        self.plist.delete(*self.plist.get_children())
+        self.plist.insert("", "end", iid="HBM5", text="HBM5",
+                          values=("v%04x" % m.version, human(len(m.data)),
+                                  "%d classes" % m.n_schema))
+        # Left tree lists translated keys; selecting one shows every language.
+        self.tree.delete(*self.tree.get_children())
+        self.nodes = {}
+        rows = [r for r in m.translations() if len(r[1]) > 1]
+        strs = m.strings()
+        if rows:
+            grp = self.tree.insert("", "end", text="translated keys/",
+                                   values=("%d" % len(rows), ""))
+            for did, row in rows:
+                label = row.get("en_us") or row.get("en_gb") or row.get("de") or ""
+                iid = self.tree.insert(grp, "end", text=label[:60] or ("key %d" % did),
+                                       values=("%d langs" % len(row), did))
+                self.nodes[iid] = {"_hmi_key": did, "_row": row}
+        plain = self.tree.insert("", "end", text="strings/",
+                                 values=("%d" % len(strs), ""))
+        for rid in sorted(strs):
+            iid = self.tree.insert(plain, "end", text=strs[rid][:60],
+                                   values=(len(strs[rid]), rid))
+            self.nodes[iid] = {"_hmi_str": rid, "_text": strs[rid]}
+        self.info.delete("1.0", "end")
+        self.info.insert("end", summarise_hbm5(m))
+        self.set_status("HMI definition - %d strings, %d translated keys. Read-only."
+                        % (len(strs), len(rows)))
+
     def load(self, path):
         # An update disc -- ISO or extracted folder -- before the disk-image path,
         # since an ISO would otherwise be probed for an MBR it does not have.
@@ -227,10 +290,15 @@ class Explorer(tk.Tk):
             self._load_disc(path)
             return
         self.disc = None
-        # A firmware image (.ifs) is a different container that browses the same way.
-        if looks_like_ifs(path):
+        self.hmi = None
+        if looks_like_hbm5(path):
+            self._load_hmi(path)
+            return
+        # Firmware (.ifs) and persistence (.efs) are different containers that
+        # browse the same way -- same entry shape, so one branch serves both.
+        if looks_like_ifs(path) or looks_like_efs(path):
             try:
-                fw = FirmwareImage(path)
+                fw = EfsImage(path) if looks_like_efs(path) else FirmwareImage(path)
             except Exception as e:
                 messagebox.showerror("Could not open firmware image", str(e))
                 return
@@ -293,7 +361,9 @@ class Explorer(tk.Tk):
         """Answer 'what is this image?' rather than just listing files."""
         self.info.delete("1.0", "end")
         try:
-            if self.disc:
+            if self.hmi:
+                self.info.insert("end", summarise_hbm5(self.hmi))
+            elif self.disc:
                 self.info.insert("end", summarise_update(self.disc))
             elif self.fw:
                 self.info.insert("end", summarise_firmware(self.fw))
@@ -458,6 +528,21 @@ class Explorer(tk.Tk):
             return
         self.info.delete("1.0", "end")
         self.hexv.delete("1.0", "end")
+        if self.hmi is not None:
+            ent = self.nodes.get(iid)
+            if not ent:
+                self.info.insert("end", "%s\n\n(group)\n" % name)
+                return
+            if "_row" in ent:
+                self.info.insert("end", "key %d -- %d languages\n\n"
+                                 % (ent["_hmi_key"], len(ent["_row"])))
+                for k in sorted(ent["_row"]):
+                    self.hexv.insert("end", "%-6s  %s\n" % (k, ent["_row"][k]))
+            else:
+                self.info.insert("end", "string id %d\n%d characters\n"
+                                 % (ent["_hmi_str"], len(ent["_text"])))
+                self.hexv.insert("end", ent["_text"])
+            return
         if self.disc is not None:
             ent = self.nodes.get(iid)
             if ent and "_disc_path" in ent:
