@@ -5,6 +5,7 @@
 Exits non-zero on failure, which is what CI checks before it builds an exe.
 """
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -15,6 +16,9 @@ from pcmexplorer.core import (DiskImage, RootNode, hexdump, human, mode_str,
                               parse_dirents_raw, BLKOFF, QNX6_MAGIC)
 from pcmexplorer.decode import decode_cvalue, preview, odometer_from_logbook
 from pcmexplorer.firmware import looks_like_ifs, QNX_STARTUP_MAGIC, IFS2_LZO_OFFSET
+from pcmexplorer.updatedisc import (FLASH_MAP, UpdateDisc, looks_like_update_disc,
+                                    parse_crc_record, parse_def, signature_kind,
+                                    summarise_update)
 
 SEC = 512
 CYL = 64 * 63          # small geometry keeps the test images tiny
@@ -185,6 +189,103 @@ def test_firmware_detect():
 
 
 
+def test_update_disc():
+    print("\nupdate-disc definitions")
+    d = parse_def("""
+DISCID = 12-JUN-2015-D;
+SYSTEMRELEASEID = PCM31MOPF_V476_RDW;
+CONTENTS
+{
+   PCMG02XX1221=
+   {
+      PCM31APP0115245A=
+      {
+         MODULETYPE=c;
+         CRCFILE=\\PCM31RDW400\\HEADUNIT\\PCMG02XX1221_PCM31APP.sig;
+         BASEDIR=\\PCM31RDW400\\HEADUNIT;
+         FILES=
+         {
+            .\\ADR01C0000\\PCM3_IFS1_MOPF.ifs;
+            .\\CRC\\IFS1_MOPF.CRC32;
+         };
+      };
+   };
+}
+CONTROL
+{
+   STARTUPDATE PCMG02XX1221;
+      UPDATE PCM31APP0115245A;
+   ENDUPDATE;
+};
+""")
+    check("parse_def() reads SYSTEMRELEASEID",
+          d["systemreleaseid"] == "PCM31MOPF_V476_RDW", str(d["systemreleaseid"]))
+    check("parse_def() reads DISCID", d["discid"] == "12-JUN-2015-D")
+    check("parse_def() reads the CONTROL dispatch table",
+          len(d["units"]) == 1 and d["units"][0]["id"] == "PCMG02XX1221")
+    check("parse_def() links unit -> modules",
+          d["units"][0]["modules"] == ["PCM31APP0115245A"])
+    check("parse_def() reads the module payload list",
+          len(d["modules"]["PCM31APP0115245A"]["files"]) == 2,
+          str(d["modules"].get("PCM31APP0115245A", {}).get("files")))
+    check("parse_def() types the module",
+          d["modules"]["PCM31APP0115245A"]["type"] == "APP")
+
+    rec = parse_crc_record("/dev/fs0, 001C0000, 008DFEA4, 26D8DF73\n"
+                           "#File,  startadr, length, CRC\n")
+    check("parse_crc_record() decodes address/length/CRC",
+          rec == ("/dev/fs0", 0x001C0000, 0x008DFEA4, 0x26D8DF73), str(rec))
+    check("parse_crc_record() rejects junk", parse_crc_record("nonsense") is None)
+
+    # .sig files are RSA signatures, not checksums -- 264 bytes of ASCII
+    sig = b"[RSA]=" + (b"ab" * 128) + b";\n"
+    check("signature_kind() identifies RSA-1024",
+          signature_kind(sig) == ("RSA", 128), str(signature_kind(sig)))
+    check("signature_kind() flags our unsigned marker",
+          signature_kind(b"[UNSIGNED] renumbered\n")[0] == "UNSIGNED")
+    check("signature_kind() handles a missing file",
+          signature_kind(None)[0] == "missing")
+
+    check("flash map knows the IFS1 address",
+          FLASH_MAP[0x001C0000].startswith("IFS1"))
+    check("looks_like_update_disc() rejects a non-disc",
+          not looks_like_update_disc(os.path.join(tempfile.gettempdir(),
+                                                  "pcmx_does_not_exist")))
+
+    # An extracted disc is a folder; a folder with a .def in it is a disc.
+    d = os.path.join(tempfile.gettempdir(), "pcmx_disc")
+    os.makedirs(d, exist_ok=True)
+    try:
+        with open(os.path.join(d, "PCM31RDW400.def"), "w") as f:
+            f.write("SYSTEMRELEASEID = PCM31MOPF_V476_RDW;\n"
+                    "CONTROL\n{\n   STARTUPDATE PCMG02XX1221;\n"
+                    "      UPDATE PCM31APP0115245A;\n   ENDUPDATE;\n};\n")
+        check("looks_like_update_disc() accepts an extracted folder",
+              looks_like_update_disc(d))
+        with UpdateDisc(d) as disc:
+            check("UpdateDisc.files() lists the folder", len(disc.files()) == 1)
+            defs = disc.definitions()
+            check("UpdateDisc.definitions() parses the folder",
+                  len(defs) == 1 and list(defs.values())[0]["units"][0]["id"]
+                  == "PCMG02XX1221")
+            check("summarise_update() renders", "PCM31MOPF_V476_RDW"
+                  in summarise_update(disc))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_version():
+    print("\nversion reporting")
+    import pcmexplorer
+    check("__version__ is set", bool(pcmexplorer.__version__),
+          pcmexplorer.__version__)
+    check("version_string() includes the version",
+          pcmexplorer.__version__ in pcmexplorer.version_string(),
+          pcmexplorer.version_string())
+    check("build_id() is a string (empty when run from source)",
+          isinstance(pcmexplorer.build_id(), str))
+
+
 def test_real_image_if_present():
     """Runs the full filesystem self-test if a real image happens to be around."""
     path = os.environ.get("PCM_TEST_IMAGE")
@@ -209,6 +310,8 @@ def main():
     test_rootnode()
     test_decoders()
     test_firmware_detect()
+    test_update_disc()
+    test_version()
     test_real_image_if_present()
     print("\n%s" % ("ALL PASSED" if not _fails
                     else "FAILED: " + ", ".join(_fails)))

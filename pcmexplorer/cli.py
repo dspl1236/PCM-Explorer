@@ -2,10 +2,13 @@
 import os
 import sys
 
+from . import version_string
+
 from .core import (DiskImage, build_paths, hexdump, human, is_dir, is_link,
                    mode_str, safe_name)
 from .decode import preview, summarise_disk, summarise_firmware
 from .firmware import FirmwareImage, looks_like_ifs
+from .updatedisc import UpdateDisc, looks_like_update_disc, summarise_update
 
 USAGE = """PCM Explorer -- browse a Porsche PCM / Audi MMI hard-drive image.
 
@@ -20,9 +23,19 @@ USAGE = """PCM Explorer -- browse a Porsche PCM / Audi MMI hard-drive image.
   pcm-explorer <image> salvage <part>       recover names without a superblock
   pcm-explorer <image> gui                  open the desktop UI
 
-Accepts a raw disk image OR a firmware image (PCM3_IFS1.ifs / PCM3_IFS2.ifs).
+Update discs (a .ISO, or an already-extracted disc folder):
 
-<part> is P1/P2/P3.  <offset> accepts 0x hex.  The image is opened read-only.
+  pcm-explorer <disc>                       what is this disc, and what takes it?
+  pcm-explorer <disc> units                 unit IDs -> which releases accept them
+  pcm-explorer <disc> modules               modules per release, with payload counts
+  pcm-explorer <disc> crc                   verify every CRC32 against its payload
+  pcm-explorer <disc> sigs                  signature inventory
+  pcm-explorer <disc> files [pattern]       list files on the disc
+
+Accepts a raw disk image, a firmware image (PCM3_IFS1.ifs / PCM3_IFS2.ifs),
+or a PCM 3.1 update disc.
+
+<part> is P1/P2/P3.  <offset> accepts 0x hex.  Everything is opened read-only.
 """
 
 
@@ -188,16 +201,113 @@ def cmd_salvage(img, pname):
     return 0
 
 
+def _disc_cmd(disc, cmd, a):
+    """Update-disc subcommands."""
+    if cmd in ("summary", "parts"):
+        print(summarise_update(disc))
+        return 0
+
+    defs = disc.definitions()
+
+    if cmd == "units":
+        by_unit = {}
+        for path, d in defs.items():
+            rel = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            for u in d["units"]:
+                by_unit.setdefault(u["id"], set()).add(rel)
+        if not by_unit:
+            print("no CONTROL dispatch entries found")
+            return 1
+        print("%-14s %-18s %s" % ("UNIT ID", "GENERATION", "ACCEPTED BY"))
+        for uid in sorted(by_unit):
+            gen = "MOPF (02)" if uid[4:6] == "02" else "pre-facelift (01)"
+            print("%-14s %-18s %s" % (uid, gen, ", ".join(sorted(by_unit[uid]))))
+        return 0
+
+    if cmd == "modules":
+        for path in sorted(defs):
+            d = defs[path]
+            print("\n%s   %s" % (path.rsplit("/", 1)[-1],
+                                 d["systemreleaseid"] or ""))
+            if d["units"]:
+                order = d["units"][0]["modules"]
+            else:
+                order = sorted(d["modules"])
+            for mid in order:
+                info = d["modules"].get(mid)
+                if not info:
+                    print("    %-22s (not defined in CONTENTS)" % mid)
+                    continue
+                from .updatedisc import MODULE_ROLE
+                print("    %-22s %-34s %d file%s"
+                      % (mid, MODULE_ROLE.get(info["type"], ""),
+                         len(info["files"]), "" if len(info["files"]) == 1 else "s"))
+        return 0
+
+    if cmd in ("crc", "verify"):
+        rows = disc.verify_crcs(a[0] if a else None)
+        if not rows:
+            print("no CRC32 records found")
+            return 1
+        npass = nfail = nabs = 0
+        for name, status, detail in rows:
+            tag = {"pass": "PASS", "fail": "FAIL", "absent": "----"}[status]
+            print("  [%s] %-30s %s" % (tag, name.rsplit("/", 1)[-1], detail))
+            npass += status == "pass"
+            nfail += status == "fail"
+            nabs += status == "absent"
+        print("\n%d passed, %d failed, %d payload absent" % (npass, nfail, nabs))
+        return 1 if nfail else 0
+
+    if cmd == "sigs":
+        sigs = disc.signatures()
+        if not sigs:
+            print("no .sig files found")
+            return 1
+        kinds = {}
+        for _n, algo, nbytes in sigs:
+            key = "%s-%d" % (algo, nbytes * 8) if nbytes else algo
+            kinds[key] = kinds.get(key, 0) + 1
+        for k in sorted(kinds):
+            print("  %-14s %d" % (k, kinds[k]))
+        print("\n%d signature files" % len(sigs))
+        if any(a2 == "RSA" for _n, a2, _b in sigs):
+            print("RSA-signed: a modified module cannot be signed without the "
+                  "private key.")
+        return 0
+
+    if cmd == "files":
+        pat = a[0].lower() if a else None
+        n = 0
+        for p in disc._files():
+            if pat and pat not in p.lower():
+                continue
+            sz = disc.size_of(p)
+            print("  %10s  %s" % (human(sz) if sz is not None else "-", p))
+            n += 1
+        print("\n%d file%s" % (n, "" if n == 1 else "s"))
+        return 0
+
+    print("unknown update-disc command: %s" % cmd)
+    print("try: summary, units, modules, crc, sigs, files")
+    return 1
+
+
 def main(argv):
     try:                       # console codepages vary; never crash on output
         sys.stdout.reconfigure(errors="replace")
     except Exception:
         pass
+    if argv and argv[0] in ("-V", "--version", "version"):
+        print("PCM Explorer %s" % version_string())
+        return 0
     if not argv or argv[0] in ("-h", "--help", "help"):
+        print("PCM Explorer %s\n" % version_string())
         print(USAGE)
         return 0
     path = argv[0]
-    if not os.path.isfile(path):
+    # a directory is only meaningful as an extracted update-disc tree
+    if not os.path.isfile(path) and not os.path.isdir(path):
         print("not a file: %s" % path)
         return 1
     cmd = argv[1] if len(argv) > 1 else "summary"
@@ -206,6 +316,22 @@ def main(argv):
         from .gui import run
         run(path)
         return 0
+
+    # An update disc -- an ISO, or a folder it was extracted to.
+    if looks_like_update_disc(path):
+        try:
+            disc = UpdateDisc(path)
+        except Exception as e:
+            print("not a readable update disc: %s" % e)
+            return 1
+        try:
+            return _disc_cmd(disc, cmd, argv[2:])
+        finally:
+            disc.close()
+
+    if not os.path.isfile(path):
+        print("not a file: %s" % path)
+        return 1
 
     # A firmware image is a different container but browses the same way.
     if looks_like_ifs(path):

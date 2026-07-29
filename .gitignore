@@ -16,3 +16,6 @@ venv/
 *.dd
 *.raw
 tree.txt
+
+# CI writes this just before packaging; never committed
+pcmexplorer/_build.py

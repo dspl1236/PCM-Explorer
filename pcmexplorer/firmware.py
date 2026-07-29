@@ -184,7 +184,24 @@ class FirmwareImage:
         """Same shape as the filesystem readers, so callers need no special case."""
         return self.entries()
 
+    def find(self, path):
+        """Look an entry up by path.  Tolerates a missing container prefix, so
+        '/etc/foo.cfg' finds '/mnt/ifs-root/etc/foo.cfg'."""
+        want = "/" + str(path).lstrip("/")
+        for p, e in self.entries():
+            if p == want:
+                return e
+        for p, e in self.entries():             # suffix match across the prefix
+            if p.endswith(want):
+                return e
+        return None
+
     def read_file(self, ent):
+        """Accepts an entry dict or a path string."""
+        if isinstance(ent, str):
+            ent = self.find(ent)
+            if ent is None:
+                return b""
         if ent.get("_data_off") is None:
             return b""
         return self.data[ent["_data_off"]:ent["_data_off"] + ent["size"]]

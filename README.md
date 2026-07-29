@@ -20,6 +20,10 @@ python explorer.py disk.img verify P2                 # filesystem self-test
 
 python explorer.py PCM3_IFS1.ifs                      # firmware images too
 python explorer.py PCM3_IFS2.ifs ls /mnt/ifs_app/HBproject
+
+python explorer.py PCM_NA_20150721.ISO                # and update discs
+python explorer.py update.iso units                   # which head units accept it
+python explorer.py update.iso crc                     # verify every payload
 ```
 
 ## What it does
@@ -30,6 +34,9 @@ python explorer.py PCM3_IFS2.ifs ls /mnt/ifs_app/HBproject
 - **Opens firmware as well as drives.** `PCM3_IFS1.ifs` and `PCM3_IFS2.ifs` from an
   official update package browse exactly like a disk, so "does this release contain X"
   is a directory listing rather than a reverse-engineering session.
+- **Reads update discs** — a `.ISO` directly, no extraction needed, or a folder you
+  already extracted. Tells you which head units a disc will actually install on, what
+  each module writes and where in flash, and verifies every CRC32 against its payload.
 - **Decodes what it finds** — `CVALUE*.CVA` coding tables, the odometer inside the
   driver's-logbook database, ELF architecture, PNG dimensions.
 - **Maps the partitions** and identifies the filesystem in each — **QNX6 and QNX4** — reading
@@ -125,10 +132,13 @@ python explorer.py
 
 Download **[PCM-Explorer.exe](https://github.com/dspl1236/PCM-Explorer/releases/download/latest/PCM-Explorer.exe)**
 — a standalone build, no install required. That link always serves the current build of
-`main`; numbered [releases](../../releases) are there if you'd rather pin a version.
+`main`; numbered [releases](../../releases) are there if you'd rather pin a version, and
+they also carry a `PCM-Explorer-<version>.exe` copy if you want the version in the
+filename.
 
-Every build runs the test suite first, so a broken reader never ships as a download, and
-each one is published with its
+Every build shows its version and commit in the title bar and under `--version`, so a bug
+report can name the exact build it came from. Every build also runs the test suite first,
+so a broken reader never ships as a download, and each is published with its
 [SHA256](https://github.com/dspl1236/PCM-Explorer/releases/download/latest/PCM-Explorer.exe.sha256).
 
 The exe is unsigned, so SmartScreen will warn on first run: **More info → Run anyway**.
@@ -178,8 +188,12 @@ four primary entries would miss most of the disk, including `persistence`.
 
 That layout is derived from [DrGER's MMI3G-HDD-Prep-Tool](https://github.com/DrGER2/MMI3G-HDD-Prep-Tool),
 which formats these drives. The extended-partition handling is verified against a
-synthetic disk built to that layout; **it has not yet been run against a real MMI image** —
-if you have one, an issue saying whether it worked would be genuinely useful.
+synthetic disk built to that layout.
+
+MMI **firmware** is confirmed working against a real image: the `ifs-root.ifs` from an
+MMI 3G+ package (`8R0906961ES`, variant MU9411) opens and enumerates correctly — 43.7 MB
+compressed, 99.4 MB inflated, 345 files. A real MMI *drive* image is still untested; if
+you have one, an issue saying whether it worked would be genuinely useful.
 
 ## Contributing
 

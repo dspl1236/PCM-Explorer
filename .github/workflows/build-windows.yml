@@ -45,6 +45,33 @@ jobs:
       - name: CLI sanity check
         run: python explorer.py --help
 
+      # The version in __init__.py is the source of truth. A tagged build must
+      # match its tag, otherwise the download and the title bar would disagree.
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (python -c "import pcmexplorer; print(pcmexplorer.__version__)").Trim()
+          $sha = "${{ github.sha }}".Substring(0,7)
+          if ("${{ github.ref }}" -like "refs/tags/v*") {
+            $tag = "${{ github.ref_name }}" -replace '^v',''
+            if ($tag -ne $v) {
+              Write-Error "tag v$tag does not match __version__ $v -- bump pcmexplorer/__init__.py"
+              exit 1
+            }
+          }
+          "version=$v"  | Out-File -Append $env:GITHUB_OUTPUT
+          "commit=$sha" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "version $v, commit $sha"
+
+      # Stamp the build so a downloaded exe can name its exact commit.
+      - name: Stamp build id
+        shell: pwsh
+        run: |
+          "COMMIT = `"${{ steps.ver.outputs.commit }}`"" |
+            Out-File -Encoding ascii pcmexplorer\_build.py
+          python -c "import pcmexplorer; print('stamped:', pcmexplorer.version_string())"
+
       - name: Install PyInstaller
         run: pip install pyinstaller
 
@@ -56,6 +83,15 @@ jobs:
           --name PCM-Explorer
           --collect-submodules pcmexplorer
           explorer.py
+
+      # A second, version-named copy. PCM-Explorer.exe keeps its stable name so
+      # the rolling download link in the README never breaks; the versioned copy
+      # is what people keep alongside an image they are archiving.
+      - name: Versioned copy
+        shell: pwsh
+        run: |
+          Copy-Item dist\PCM-Explorer.exe `
+            "dist\PCM-Explorer-${{ steps.ver.outputs.version }}.exe"
 
       - name: Checksum
         shell: pwsh
@@ -86,7 +122,11 @@ jobs:
             dist/PCM-Explorer.exe
             dist/PCM-Explorer.exe.sha256
           body: |
-            Automatic build of the latest `main` (${{ github.sha }}).
+            Automatic build of the latest `main`.
+
+            **Version ${{ steps.ver.outputs.version }}, build `${{ steps.ver.outputs.commit }}`** —
+            the app shows this in its title bar and `--version`, so a bug report
+            can name the exact build.
 
             No Python needed — download and run. The exe is unsigned, so
             SmartScreen will warn on first run: **More info → Run anyway**.
@@ -99,12 +139,19 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          name: PCM Explorer ${{ steps.ver.outputs.version }}
           files: |
             dist/PCM-Explorer.exe
+            dist/PCM-Explorer-${{ steps.ver.outputs.version }}.exe
             dist/PCM-Explorer.exe.sha256
           generate_release_notes: true
           body: |
             Standalone Windows build — no Python needed.
+            **Version ${{ steps.ver.outputs.version }}** (build `${{ steps.ver.outputs.commit }}`).
+
+            Two identical binaries: `PCM-Explorer.exe` for the stable download
+            link, and `PCM-Explorer-${{ steps.ver.outputs.version }}.exe` if you
+            want the version in the filename.
 
             The exe is unsigned, so SmartScreen will warn on first run:
             **More info → Run anyway**. Verify against the published SHA256

@@ -2,6 +2,8 @@
 import os
 import threading
 
+from . import version_string
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -9,13 +11,15 @@ from .core import (DiskImage, build_paths, hexdump, human, is_dir, is_link,
                    mode_str, NIL)
 from .decode import preview, summarise_disk, summarise_firmware
 from .firmware import FirmwareImage, looks_like_ifs
+from .updatedisc import UpdateDisc, looks_like_update_disc, summarise_update
 
 BG, PANEL, LINE = "#14161a", "#1b1e24", "#2b3038"
 TEXT, DIM, ACCENT = "#dfe3ea", "#8b93a1", "#d2a24c"
 
-OPEN_TYPES = [("Head-unit images", "*.img *.dd *.raw *.bin *.ifs"),
+OPEN_TYPES = [("Head-unit images", "*.img *.dd *.raw *.bin *.ifs *.iso"),
               ("Disk images", "*.img *.dd *.raw *.bin"),
               ("Firmware images", "*.ifs"),
+              ("Update discs", "*.iso"),
               ("All files", "*.*")]
 PREVIEW_BYTES = 4096
 
@@ -30,11 +34,12 @@ def _printable_ratio(b):
 class Explorer(tk.Tk):
     def __init__(self, initial=None):
         super().__init__()
-        self.title("PCM Explorer")
+        self.title("PCM Explorer %s" % version_string())
         self.geometry("1200x780")
         self.configure(bg=BG)
         self.img = None
         self.fw = None            # FirmwareImage when a .ifs is open
+        self.disc = None          # UpdateDisc when an .iso / disc folder is open
         self.fs = None            # QNX6FS/QNX4FS when the partition mounts
         self.nodes = {}           # tree item id -> inode dict
         self.salvage = {}         # fallback directory map
@@ -67,8 +72,12 @@ class Explorer(tk.Tk):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=8, pady=8)
         ttk.Button(top, text="Open image...", command=self.open_image).pack(side="left")
+        ttk.Button(top, text="Open folder...", command=self.open_folder).pack(side="left",
+                                                                             padx=(6, 0))
         self.lbl = ttk.Label(top, text="(no image loaded)", style="Dim.TLabel")
         self.lbl.pack(side="left", padx=12)
+        # Version in the corner: the first thing to ask when someone reports a bug.
+        ttk.Label(top, text=version_string(), style="Dim.TLabel").pack(side="right")
 
         pan = ttk.PanedWindow(self, orient="horizontal")
         pan.pack(fill="both", expand=True, padx=8)
@@ -129,7 +138,95 @@ class Explorer(tk.Tk):
         if p:
             self.load(p)
 
+    def open_folder(self):
+        """An update disc that has already been extracted is a folder, not a file."""
+        p = filedialog.askdirectory(title="Open an extracted update-disc folder")
+        if p:
+            self.load(p)
+
+    def _load_disc(self, path):
+        """An update disc -- an ISO, or a folder it was extracted to."""
+        try:
+            disc = UpdateDisc(path)
+        except Exception as e:
+            messagebox.showerror("Could not open update disc", str(e))
+            return
+        if self.img:
+            self.img.close()
+        self.img, self.fw, self.fs, self.disc = None, None, None, disc
+        self.lbl.config(text="%s   update disc" % os.path.basename(path.rstrip("/\\")))
+        self.plist.delete(*self.plist.get_children())
+        defs = disc.definitions()
+        for dpath in sorted(defs):
+            d = defs[dpath]
+            self.plist.insert("", "end", iid=dpath,
+                              text=dpath.rsplit("/", 1)[-1],
+                              values=(d["systemreleaseid"] or "-",
+                                      "%d units" % len(d["units"]),
+                                      d["discid"] or ""))
+        self._fill_disc(disc)
+        self.info.delete("1.0", "end")
+        self.info.insert("end", summarise_update(disc))
+        self.set_status("Update disc - %d files, %d definitions. Read-only."
+                        % (len(disc.files()), len(defs)))
+
+    def _show_definition(self, dpath):
+        """A release definition selected in the left pane: who can install it, and what."""
+        from .updatedisc import MODULE_ROLE
+        d = self.disc.definitions().get(dpath)
+        self.info.delete("1.0", "end")
+        self.hexv.delete("1.0", "end")
+        if not d:
+            return
+        self.info.insert("end", "%s\n\nSYSTEMRELEASEID  %s\nDISCID           %s\n\n"
+                         % (dpath, d["systemreleaseid"] or "-", d["discid"] or "-"))
+        if d["units"]:
+            self.info.insert("end", "Installs on %d unit%s:\n"
+                             % (len(d["units"]), "" if len(d["units"]) == 1 else "s"))
+            for u in d["units"]:
+                gen = "MOPF" if u["id"][4:6] == "02" else "pre-facelift"
+                self.info.insert("end", "  %-14s %s\n" % (u["id"], gen))
+            self.info.insert("end", "\nModules:\n")
+            for mid in d["units"][0]["modules"]:
+                info = d["modules"].get(mid)
+                role = MODULE_ROLE.get(info["type"], "") if info else "(not in CONTENTS)"
+                nfile = len(info["files"]) if info else 0
+                self.info.insert("end", "  %-22s %-34s %d files\n" % (mid, role, nfile))
+        else:
+            self.info.insert("end", "No CONTROL dispatch entries -- nothing installs "
+                                    "from this definition.\n")
+        data = self.disc.read(dpath)
+        if data:
+            self.hexv.insert("end", data.decode("latin-1", "replace"))
+
+    def _fill_disc(self, disc):
+        """Discs are a flat path list, so rebuild the folder structure to browse."""
+        self.tree.delete(*self.tree.get_children())
+        self.nodes = {}
+        folders = {"": ""}
+        for pth in disc.files():
+            parts = [x for x in pth.split("/") if x]
+            if not parts:
+                continue
+            parent, walked = "", ""
+            for seg in parts[:-1]:
+                walked += "/" + seg
+                if walked not in folders:
+                    folders[walked] = self.tree.insert(parent, "end", text=seg + "/",
+                                                       values=("", ""))
+                parent = folders[walked]
+            sz = disc.size_of(pth)
+            iid = self.tree.insert(parent, "end", text=parts[-1],
+                                   values=(human(sz) if sz is not None else "", ""))
+            self.nodes[iid] = {"_disc_path": pth, "size": sz or 0}
+
     def load(self, path):
+        # An update disc -- ISO or extracted folder -- before the disk-image path,
+        # since an ISO would otherwise be probed for an MBR it does not have.
+        if looks_like_update_disc(path):
+            self._load_disc(path)
+            return
+        self.disc = None
         # A firmware image (.ifs) is a different container that browses the same way.
         if looks_like_ifs(path):
             try:
@@ -196,7 +293,9 @@ class Explorer(tk.Tk):
         """Answer 'what is this image?' rather than just listing files."""
         self.info.delete("1.0", "end")
         try:
-            if self.fw:
+            if self.disc:
+                self.info.insert("end", summarise_update(self.disc))
+            elif self.fw:
                 self.info.insert("end", summarise_firmware(self.fw))
             elif self.img:
                 self.set_status("Building summary...")
@@ -208,7 +307,12 @@ class Explorer(tk.Tk):
     # -- partition selected --
     def on_part(self, _evt=None):
         sel = self.plist.selection()
-        if not sel or not self.img:
+        if not sel:
+            return
+        if self.disc is not None:
+            self._show_definition(sel[0])
+            return
+        if not self.img:
             return
         p = self.img.part(sel[0])
         if not p:
@@ -327,12 +431,40 @@ class Explorer(tk.Tk):
             iid = self.tree.parent(iid)
         return "/" + "/".join(reversed(parts))
 
+    def _show_disc_node(self, iid, ent, name):
+        """Disc entries are plain paths, not inodes -- preview them directly."""
+        pth = ent["_disc_path"]
+        self.info.insert("end", "%s\npath   %s\nsize   %s\n"
+                         % (name, pth, human(ent["size"])))
+        data = self.disc.read(pth) or b""
+        if pth.lower().endswith((".def", ".crc32", ".sig", ".cfg", ".txt", ".csv")):
+            self.hexv.insert("end", data.decode("latin-1", "replace"))
+            return
+        txt = None
+        try:
+            txt = preview(pth, data[:PREVIEW_BYTES])
+        except Exception:
+            txt = None
+        if txt is not None:
+            self.hexv.insert("end", txt)
+        elif _printable_ratio(data[:512]) > 0.9:
+            self.hexv.insert("end", data[:PREVIEW_BYTES].decode("latin-1", "replace"))
+        else:
+            self.hexv.insert("end", hexdump(data[:PREVIEW_BYTES], 0))
+
     def on_node(self, _evt=None):
         iid, inode, name = self._sel()
         if iid is None:
             return
         self.info.delete("1.0", "end")
         self.hexv.delete("1.0", "end")
+        if self.disc is not None:
+            ent = self.nodes.get(iid)
+            if ent and "_disc_path" in ent:
+                self._show_disc_node(iid, ent, name)
+            else:
+                self.info.insert("end", "%s\n\n(folder)\n" % name)
+            return
         if inode is None:
             self.info.insert("end", "%s\n\nSalvage mode — this entry's name was recovered\n"
                                     "from a directory block, but without a readable\n"
