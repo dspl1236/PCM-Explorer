@@ -1,6 +1,7 @@
 # PCM Explorer
 
-**Open and browse the hard drive out of a Porsche PCM or Audi MMI head unit — on your desktop, read-only.**
+**Open a Porsche PCM or Audi MMI head unit — its drive, its firmware, its update discs,
+its persistence flash, and its user interface — on your desktop, read-only.**
 
 These units run QNX, and their drives use the **QNX6** "power-safe" filesystem — or **QNX4**
 on older drives and on the navigation partition of every one. Windows can't read either.
@@ -8,7 +9,8 @@ macOS can't. Linux ships a read-only `qnx6` driver aimed at QNX 6.4+, which does
 Harman variant these head units actually use. So when a head unit dies and you image the
 drive, you get a 40 GB file that nothing will open.
 
-This opens it.
+This opens it — and, as it turned out, everything else the unit is made of: the firmware
+images, the update discs, the persistence flash, and the interface itself.
 
 ```
 python explorer.py                                    # desktop UI
@@ -26,7 +28,9 @@ python explorer.py update.iso units                   # which head units accept 
 python explorer.py update.iso crc                     # verify every payload
 
 python explorer.py PCM3_HBpersistence.efs             # factory persistence flash
-python explorer.py cayenne.mmi langs                  # the HMI, in every language
+python explorer.py moccaV2Target.mmi                  # the HMI itself
+python explorer.py moccaV2Target.mmi langs            # every string, every language
+python explorer.py moccaV2Target.mmi screens 33616    # a screen's elements, x/y/w/h
 
 python explorer.py diff old.ifs new.ifs               # what changed between builds
 python explorer.py diff ./car_hbp PCM3_HBpersistence.efs   # a car vs the factory
@@ -47,8 +51,9 @@ python explorer.py diff ./car_hbp PCM3_HBpersistence.efs   # a car vs the factor
   — the factory contents of `/HBpersistence`, which is the baseline to compare a real
   car against.
 - **Reads the HMI itself.** The PCM interface is not compiled in; it is data, in
-  `.mmi` files. Every screen string the unit can display, in all nine languages —
-  ten on the instrument cluster, which is the only place Chinese appears.
+  `.mmi` files. Every string the unit can display in all nine languages — ten on the
+  instrument cluster, which is the only place Chinese appears — and the screens, with
+  real element geometry on an 800×480 display.
 - **Compares any two of them.** `diff` works across kinds: two firmware builds, or a
   car's exported `/HBpersistence` folder against the factory flash image.
 - **Decodes what it finds** — `CVALUE*.CVA` coding tables, the odometer inside the
@@ -107,6 +112,45 @@ Firmware image: PCM3_IFS1.ifs
 Jukebox support: YES (7 references to /mnt/media)
 hddmounter present: yes
 ```
+
+## The HMI
+
+The PCM's interface is not compiled into the HMI binary. It is data — 34 `.mmi` files
+sitting beside `PCM3Reload` in IFS2, in a container that identifies itself as `HBM5`.
+`cayenne.mmi` is one car's screens; `en_us.mmi` and `ru_ru.mmi` are the same interface
+in different words. So the whole UI can be read without emulating anything.
+
+```
+python explorer.py moccaV2Target.mmi strings Jukebox   # search every string
+python explorer.py moccaV2Target.mmi langs             # keys across all languages
+python explorer.py moccaV2Target.mmi screens           # what screens exist
+python explorer.py moccaV2Target.mmi screens 33616     # one screen's elements
+```
+
+In the desktop UI a `screens/` group lists them by name, and **View screen** draws one
+on an 800×480 canvas.
+
+Some payloads are compressed. The codec is **stock LZRW2** — Ross Williams' public-domain
+compressor, unmodified, which Harman's own class name (`HBLZRW2Compression.cpp`) says
+plainly. Only the container framing is Harman's, and misreading it is what made the
+algorithm look exotic: the header is three fields, and what looks like two more bytes is
+the first control word, sixteen zero bits meaning sixteen literals. That is why these
+blobs appear to begin with readable text. 4,810 of 4,810 blocks decode to exactly their
+declared length.
+
+Beware the declared length as an oracle, though — stock LZRW3-A also hits it on every
+block while producing `von 123123456ungsanfang bis12345678901234ende` where the real
+string reads `von Aufzeichnungsanfang bis Aufzeichnungsende`. The `123456789012345678`
+you will find in the binary is the uninitialised-slot seed leaking through.
+
+**What this does not do:** draw the actual pixels. Screens come out as labelled boxes,
+not a render. Bitmaps are not in these files at all — four `CBitmap` records corpus-wide,
+all degenerate — so the graphics live somewhere else and finding them is a separate hunt.
+Nor is there any navigation: all 36 HMI classes are `NHBHMI::NDrawing::*`, purely
+presentational. There is no screen, menu, button, event or transition class, because the
+flow is compiled into `PCM3Reload` rather than stored as data. A wireframe is still enough
+to recognise a screen and to lay out a custom one that matches the OEM metrics — list rows
+are 664×69, buttons 66×57, the content area 800×364 at y=59.
 
 ## Salvage mode
 
