@@ -18,6 +18,8 @@ from pcmexplorer.decode import decode_cvalue, preview, odometer_from_logbook
 from pcmexplorer.firmware import looks_like_ifs, QNX_STARTUP_MAGIC, IFS2_LZO_OFFSET
 from pcmexplorer.efs import EfsImage, looks_like_efs
 from pcmexplorer.hbm5 import Hbm5File, looks_like_hbm5, read_varint
+from pcmexplorer.hbm5geom import (ANCHOR_KINDS, DISPLAY_H, DISPLAY_W,
+                                  _varint as _gvarint)
 from pcmexplorer.diffimg import compare, format_report, open_side
 from pcmexplorer.updatedisc import (FLASH_MAP, UpdateDisc, looks_like_update_disc,
                                     parse_crc_record, parse_def, signature_kind,
@@ -417,6 +419,26 @@ def test_hbm5():
           not looks_like_hbm5(os.path.join(tempfile.gettempdir(), "pcmx_nope.mmi")))
 
 
+def test_hbm5_geom():
+    print("\nHBM5 geometry")
+    # The two coexisting varint schemes. Getting these confused is what made
+    # records look like they carried a variable-length prefix.
+    check("scalar scheme: 0x7f is one byte", _gvarint(b"\x7f", 0) == (127, 1))
+    check("scalar scheme: 0x81 0x00 is 256", _gvarint(b"\x81\x00", 0) == (256, 2))
+    check("CPoint scheme: 0x7f 0x00 is two bytes",
+          _gvarint(b"\x7f\x00", 0, point=True) == (0x3F00, 2),
+          str(_gvarint(b"\x7f\x00", 0, point=True)))
+    check("CPoint scheme: 0x3f is still one byte",
+          _gvarint(b"\x3f", 0, point=True) == (63, 1))
+    check("both share the 3-byte form",
+          _gvarint(b"\xc2\x6e\xea", 0) == _gvarint(b"\xc2\x6e\xea", 0, point=True)
+          == (159466, 3))
+    check("both share the 0xf0 escape",
+          _gvarint(b"\xf0\x00\x01\x00\x00", 0) == (65536, 5))
+    check("display constants", (DISPLAY_W, DISPLAY_H) == (800, 480))
+    check("anchor kinds are the left/right pair", ANCHOR_KINDS == (21, 22))
+
+
 def test_version():
     print("\nversion reporting")
     import pcmexplorer
@@ -457,6 +479,7 @@ def main():
     test_efs_detect()
     test_diff()
     test_hbm5()
+    test_hbm5_geom()
     test_version()
     test_real_image_if_present()
     print("\n%s" % ("ALL PASSED" if not _fails

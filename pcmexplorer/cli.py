@@ -45,6 +45,7 @@ HMI definitions (.mmi) hold the screens and every string the unit can display:
   pcm-explorer <x.mmi> strings [pattern]    every readable string, with its id
   pcm-explorer <x.mmi> langs [pattern]      keys resolved across all languages
   pcm-explorer <x.mmi> verify               container self-check
+  pcm-explorer <x.mmi> screens [root]       drawables resolved to x/y/w/h
 
 Compare any two of the above:
 
@@ -412,8 +413,43 @@ def _hbm5_cmd(m, cmd, a):
             print("\n%d translated key%s" % (shown, "" if shown == 1 else "s"))
         return 0
 
+    if cmd in ("screens", "boxes"):
+        from .hbm5geom import Screens
+        sc = Screens(m)
+        st = sc.stats()
+        print("  %-26s %d" % ("drawables", st["drawables"]))
+        print("  %-26s %d" % ("position by reference", st["position_by_reference"]))
+        print("  %-26s %d" % ("references resolved", st["references_resolved"]))
+        print("  %-26s %d" % ("boxes within 800x480", st["boxes_on_screen"]))
+        if a:
+            try:
+                root = int(a[0], 0)
+            except ValueError:
+                print("usage: screens [root-id]")
+                return 1
+            seen, stack, rows = set(), [root], []
+            while stack:
+                rid = stack.pop()
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                b = sc.box(rid)
+                if b:
+                    rows.append((rid, b, sc.label(rid)))
+                stack.extend(sc.children(rid))
+            print("\n  subtree %d: %d nodes, %d with boxes\n" % (root, len(seen), len(rows)))
+            print("  %-8s %5s %5s %5s %5s  %-4s %s"
+                  % ("id", "x", "y", "w", "h", "src", "label"))
+            for rid, b, lab in sorted(rows, key=lambda r: (r[1][1], r[1][0]))[:60]:
+                print("  %-8d %5d %5d %5d %5d  %-4s %s"
+                      % (rid, b[0], b[1], b[2], b[3], b[4] or "-",
+                         (lab or "")[:40]))
+            if len(rows) > 60:
+                print("  ... and %d more" % (len(rows) - 60))
+        return 0
+
     print("unknown HMI command: %s" % cmd)
-    print("try: summary, verify, strings, langs")
+    print("try: summary, verify, strings, langs, screens")
     return 1
 
 

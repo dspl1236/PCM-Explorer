@@ -1,0 +1,341 @@
+"""Screen geometry from HBM5 ``.mmi`` files -- real x/y/w/h for HMI elements.
+
+The container reader in :mod:`hbm5` gets you strings.  This gets you the
+screens: a schema-driven record decoder that resolves the drawable tree to
+boxes on an 800x480 display.
+
+## How a record is laid out
+
+Every class in the file has a schema descriptor::
+
+    u8  pad ; u8 nBases ; u16 nFields
+    u32 classCUID
+    u32 baseIndices        (one byte each, low byte first)
+    u32 moreBases
+    nFields x { u32 fieldCUID ; u32 typeCode }
+
+A record is then its inherited base-class fields first, then its own, with no
+prefix and with trailing fields omittable.  ``ptr + 16 + 8*nFields`` lands
+exactly on the next descriptor for all 167 descriptors across the corpus.
+
+Class and field names are recoverable rather than guessed: the CUID is a hash
+of the name, computed by the routine at VA ``0x0889cad8`` in PCM3Reload, with
+alternating rounds.  A class hashes from seed 0; a field hashes its own name
+(leading dot included) seeded with the class's CUID.
+
+## The varint trap
+
+Two schemes coexist, and mixing them up is what once made these records look
+like they carried a variable-length prefix.  **CPoint components** treat
+``0x40-0x7f`` as the two-byte lead; **everything else** -- lengths, counts,
+CSize, ordinary scalars -- uses ``0x80``.  Both share ``0xc0-0xef`` for three
+bytes and an ``0xf0`` escape carrying four raw big-endian bytes.  On
+single-field CPoint records, where nothing can be omitted to hide an error,
+the CPoint scheme parses 473/473 exactly against 219/473 for the other.
+
+## Position by reference
+
+A drawable carries both an inline ``mPosition`` and an ``mPositionResID``.
+When the ResID is non-zero the inline value is ``(0,0)`` and carries nothing --
+the real position is behind the reference, and roughly one drawable in eight
+is like this.  The reference usually points at a *descriptor* rather than a
+payload, holding two CPoint variants under kinds 21 and 22 which share a y and
+differ only in x: a left/right anchor pair.
+
+This is worth spelling out because it is invisible to the obvious checks.
+Exact-closure does not notice -- the field is consumed either way.  Box
+plausibility does not notice -- ``(0,0)`` is on screen.  An earlier pass
+concluded the indirection was used by three records out of ten thousand; it is
+used by 1,256, and every one of them silently rendered in the top-left corner.
+Those two oracles validate *parsing*, not *resolution*.
+"""
+import struct
+
+from .hbm5 import Hbm5File
+
+DISPLAY_W, DISPLAY_H = 800, 480
+
+CUID_CDRAWOBJECT = 0x8E2F8293
+CUID_CPOINT_RES = 0x2267FE33
+CUID_CSIZE_RES = 0x0AA3495D
+
+SCALAR1 = {0x81, 0x82, 0x84, 0x88, 0x89}
+PAIR = {0x8C, 0x8D}                 # 0x8c = CPoint, 0x8d = CSize
+BLOB = {0xA2, 0xA3}
+ARRAY = 0xA1
+
+# Kinds seen on a position descriptor: a left/right anchor pair.
+ANCHOR_KINDS = (21, 22)
+
+CLASS_NAMES = {
+    0x8E2F8293: "CDrawObject",          0x90AA9E70: "CGUIElement",
+    0xA806B8EE: "CAligningObject",      0xA3C213B8: "CBitmapObject",
+    0x71B5DB06: "CTextBase",            0x3EBA6425: "CTextObject",
+    0xBA066794: "CFormattedTextObject", 0x77F80FB9: "CTextArea",
+    0xDA63396B: "CDisplay",             0x92AE6BAD: "CColor",
+    0x57E931C3: "CAlignment",           0xC6D7DD90: "CBitmap",
+    0xE0D04503: "CFontFormat",          0x0B60D4CA: "CFontFile",
+    0x5C8F9492: "CResourceTable",       0x25B3AC9A: "<string>",
+    0x2267FE33: "<CPoint>",             0x0AA3495D: "<CSize>",
+}
+
+FIELD_NAMES = {
+    0x0A2B4963: "mParentID",       0x7F9A5557: "mDrawOrder",
+    0x7A1CC624: "mPositionResID",  0xF790B5F2: "mSizeResID",
+    0xEBD70139: "mPosition",       0x45CF85C4: "mSize",
+    0x5FFAEE1E: "m_childrenIDs",   0x1A2BEA44: "m_resourceTableID",
+    0x5A894D17: "mAlignmentResID", 0x79CC0437: "mAlignment",
+    0x94EA844C: "mBmpResID",       0xF9F3B843: "mColorsResID",
+    0xD7C9A631: "mTextResID",      0xB397877F: "mFontResID",
+    0x9960974E: "point",           0x26693065: "size",
+}
+
+
+class Truncated(Exception):
+    """A record ran off the end of its block -- expected for omitted tails."""
+
+
+def _varint(d, o, point=False):
+    """Read a varint.  ``point=True`` selects the CPoint-component scheme."""
+    if o >= len(d):
+        raise Truncated()
+    b = d[o]
+    if b >= 0xF0:
+        if o + 4 >= len(d):
+            raise Truncated()
+        return int.from_bytes(d[o + 1:o + 5], "big"), o + 5
+    if 0xC0 <= b < 0xF0:
+        if o + 2 >= len(d):
+            raise Truncated()
+        return ((b & 0x3F) << 16) | (d[o + 1] << 8) | d[o + 2], o + 3
+    lead = 0x40 if point else 0x80
+    if b < lead:
+        return b, o + 1
+    if o + 1 >= len(d):
+        raise Truncated()
+    return ((b & 0x3F) << 8) | d[o + 1], o + 2
+
+
+class Schema(object):
+    """The file's class table: field lists, with inheritance flattened."""
+
+    def __init__(self, m):
+        d = m.data
+        self.ptr = [struct.unpack_from("<I", d, m.schema_off + 4 * i)[0]
+                    for i in range(m.n_schema)]
+        self.cls = []
+        for i, p in enumerate(self.ptr):
+            nbase = d[p + 1]
+            nf = struct.unpack_from("<H", d, p + 2)[0]
+            cuid, bx, by = struct.unpack_from("<III", d, p + 4)
+            bases = list(struct.pack("<II", bx, by))[:nbase]
+            fields = [struct.unpack_from("<II", d, p + 16 + 8 * j)
+                      for j in range(nf)]
+            self.cls.append({"idx": i, "cuid": cuid, "bases": bases,
+                             "fields": fields})
+        self._flat = {}
+
+    def flat(self, i, seen=None):
+        """[(owner_idx, fieldCUID, typeCode)] -- bases first, then own."""
+        if i in self._flat:
+            return self._flat[i]
+        seen = seen or set()
+        if i in seen or i >= len(self.cls):
+            return []
+        seen = seen | {i}
+        out = []
+        for b in self.cls[i]["bases"]:
+            out.extend(self.flat(b, seen))
+        for fc, ft in self.cls[i]["fields"]:
+            out.append((i, fc, ft))
+        self._flat[i] = out
+        return out
+
+
+class Screens(object):
+    """Decoded drawables from one .mmi file."""
+
+    def __init__(self, path_or_file):
+        self.m = (path_or_file if isinstance(path_or_file, Hbm5File)
+                  else Hbm5File(path_or_file))
+        self.d = self.m.data
+        self.sch = Schema(self.m)
+        sizes = self.m.block_sizes()
+        self.ent = {}
+        for rid, off, b0, ci, _b2, comp in self.m.directory():
+            self.ent[rid] = (off, b0, ci, comp, sizes.get(rid, 0))
+        self.strs = self.m.strings()
+        self.desc = self.m.descriptors()
+        self._cache = {}
+
+    # -- record decoding --
+    def _field(self, o, ftype, depth, end):
+        t0 = ftype & 0xFF
+        if t0 < 0x80:
+            if depth > 6:
+                raise Truncated()
+            return self._record(o, t0, depth + 1, None)
+        if t0 in PAIR:
+            pt = (t0 == 0x8C)                  # only CPoint uses the 0x40 lead
+            a, o = _varint(self.d, o, pt)
+            b, o = _varint(self.d, o, pt)
+            return (a, b), o
+        if t0 in BLOB:
+            n, o = _varint(self.d, o)
+            if o + n > len(self.d):
+                raise Truncated()
+            return self.d[o:o + n], o + n
+        if t0 == ARRAY:
+            ln, o = _varint(self.d, o)
+            stop = o + ln
+            if stop > len(self.d):
+                raise Truncated()
+            cnt, o = _varint(self.d, o)
+            el = (ftype >> 16) & 0xFF
+            vals = []
+            for _ in range(cnt):
+                if o >= stop:
+                    break
+                v, o = self._field(o, el, depth + 1, stop)
+                vals.append(v)
+            return vals, stop
+        if t0 in SCALAR1:
+            return _varint(self.d, o)
+        raise Truncated()
+
+    def _record(self, o, ci, depth=0, end=None):
+        out = []
+        for (_k, fc, ft) in self.sch.flat(ci):
+            if end is not None and o >= end:
+                break
+            if o >= len(self.d):
+                break
+            try:
+                v, o = self._field(o, ft, depth, end)
+            except Truncated:
+                break                          # trailing fields may be omitted
+            out.append((fc, v))
+        return out, o
+
+    def record(self, rid):
+        """Decoded payload record as a dict, or None for descriptors/compressed."""
+        if rid in self._cache:
+            return self._cache[rid]
+        e = self.ent.get(rid)
+        if e is None:
+            return None
+        off, b0, ci, comp, n = e
+        if (b0 & 1) or comp or n <= 0:
+            self._cache[rid] = None
+            return None
+        vals, endoff = self._record(off, ci, 0, off + n)
+        r = {"__cuid": self.sch.cls[ci]["cuid"],
+             "__cls": CLASS_NAMES.get(self.sch.cls[ci]["cuid"]),
+             "__exact": endoff == off + n}
+        for fc, v in vals:
+            r[FIELD_NAMES.get(fc, "f%08x" % fc)] = v
+        self._cache[rid] = r
+        return r
+
+    # -- resolution --
+    def _typed(self, rid, cuid, key, anchor=0):
+        """Resolve a ResID to a CPoint/CSize value, following a descriptor.
+
+        The direct case is a payload of the right class.  The indirect case --
+        about one drawable in eight -- points at a descriptor holding anchor
+        variants, and must be followed rather than treated as absent.
+        """
+        r = self.record(rid)
+        if r is not None:
+            return r.get(key) if r.get("__cuid") == cuid else None
+        pairs = self.desc.get(rid)
+        if not pairs:
+            return None
+        want = ANCHOR_KINDS[anchor] if anchor < len(ANCHOR_KINDS) else None
+        chosen = None
+        for kind, pid in pairs:
+            sub = self.record(pid)
+            if sub is None or sub.get("__cuid") != cuid:
+                continue
+            val = sub.get(key)
+            if val is None:
+                continue
+            if kind == want:
+                return val
+            if chosen is None:
+                chosen = val
+        return chosen
+
+    def position(self, rid, anchor=0):
+        return self._typed(rid, CUID_CPOINT_RES, "point", anchor)
+
+    def size(self, rid, anchor=0):
+        return self._typed(rid, CUID_CSIZE_RES, "size", anchor)
+
+    def box(self, rid, anchor=0):
+        """(x, y, w, h, source) local to the parent, or None if not a drawable.
+
+        ``source`` records where the numbers came from: ``P``/``S`` for a
+        resolved position/size reference, ``p``/``s`` for the inline value.
+        """
+        r = self.record(rid)
+        if not r or "mPosition" not in r:
+            return None
+        pos, siz, src = r.get("mPosition") or (0, 0), r.get("mSize") or (0, 0), ""
+        pr, sr = r.get("mPositionResID") or 0, r.get("mSizeResID") or 0
+        if pr:
+            p = self.position(pr, anchor)
+            pos, src = (p, src + "P") if p else (pos, src + "p")
+        if sr:
+            s = self.size(sr, anchor)
+            siz, src = (s, src + "S") if s else (siz, src + "s")
+        return (pos[0], pos[1], siz[0], siz[1], src)
+
+    def text(self, rid):
+        """Text behind a ResID, following a descriptor's language variants."""
+        if rid in self.strs:
+            return self.strs[rid]
+        for _kind, pid in self.desc.get(rid, ()):
+            if pid in self.strs:
+                return self.strs[pid]
+        return None
+
+    def label(self, rid):
+        r = self.record(rid)
+        t = r.get("mTextResID") if r else None
+        return self.text(t) if t else None
+
+    # -- tree --
+    def drawables(self):
+        """Every record id that decodes as a drawable."""
+        out = []
+        for rid, (_o, b0, ci, comp, n) in self.ent.items():
+            if (b0 & 1) or comp or n <= 0:
+                continue
+            owners = {k for k, _f, _t in self.sch.flat(ci)}
+            if any(self.sch.cls[k]["cuid"] == CUID_CDRAWOBJECT for k in owners):
+                out.append(rid)
+        return sorted(out)
+
+    def children(self, rid):
+        r = self.record(rid)
+        kids = r.get("m_childrenIDs") if r else None
+        return list(kids) if isinstance(kids, list) else []
+
+    def stats(self):
+        """How well resolution is doing -- the number to watch after a change."""
+        n = indirect = resolved = onscreen = 0
+        for rid in self.drawables():
+            b = self.box(rid)
+            if not b:
+                continue
+            n += 1
+            if "P" in b[4] or "p" in b[4]:
+                indirect += 1
+                if "P" in b[4]:
+                    resolved += 1
+            if 0 <= b[0] <= DISPLAY_W and 0 <= b[1] <= DISPLAY_H \
+               and b[2] <= DISPLAY_W and b[3] <= DISPLAY_H:
+                onscreen += 1
+        return {"drawables": n, "position_by_reference": indirect,
+                "references_resolved": resolved, "boxes_on_screen": onscreen}
