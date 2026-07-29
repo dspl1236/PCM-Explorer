@@ -61,6 +61,70 @@ class Explorer(tk.Tk):
         if initial:
             self.load(initial)
 
+    def show_screen(self, root=None):
+        """Draw an HMI screen's element boxes on an 800x480 canvas.
+
+        A wireframe, not a render: positions and sizes are decoded, but the
+        bitmaps are not -- they are not in these files at all.  Labelled boxes
+        are still enough to recognise a screen and to lay a custom one out so
+        it matches.
+        """
+        if not self.hmi:
+            messagebox.showinfo("No HMI file open",
+                                "Open a .mmi file to view its screens.")
+            return
+        from .hbm5geom import Screens, DISPLAY_W, DISPLAY_H
+        if getattr(self, "_screens", None) is None:
+            self.set_status("Decoding screen geometry...")
+            self._screens = Screens(self.hmi)
+        sc = self._screens
+        if root is None:
+            sel = self.tree.selection()
+            ent = self.nodes.get(sel[0]) if sel else None
+            root = (ent or {}).get("_hmi_node")
+        if root is None:
+            messagebox.showinfo("Pick a screen",
+                                "Select a screen under \"screens/\" first.")
+            return
+
+        seen, stack, boxes = set(), [root], []
+        while stack:
+            rid = stack.pop()
+            if rid in seen or len(seen) > 20000:
+                continue
+            seen.add(rid)
+            b = sc.box(rid)
+            if b:
+                boxes.append((rid, b, sc.label(rid)))
+            stack.extend(sc.children(rid))
+
+        win = tk.Toplevel(self)
+        win.title("Screen %d -- %d elements  (wireframe: bitmaps not decoded)"
+                  % (root, len(boxes)))
+        win.configure(bg=BG)
+        cv = tk.Canvas(win, width=DISPLAY_W, height=DISPLAY_H, bg=PANEL,
+                       highlightthickness=1, highlightbackground=LINE)
+        cv.pack(padx=10, pady=10)
+        cv.create_rectangle(0, 0, DISPLAY_W, DISPLAY_H, outline=ACCENT)
+        # biggest first, so small elements land on top of their containers
+        drawn = 0
+        for _rid, b, lab in sorted(boxes, key=lambda r: -(r[1][2] * r[1][3])):
+            x, y, w, h, src = b
+            if w <= 0 or h <= 0 or x > DISPLAY_W or y > DISPLAY_H:
+                continue
+            colour = ACCENT if "P" in src else DIM
+            cv.create_rectangle(x, y, x + w, y + h, outline=colour)
+            if lab and w > 26 and h > 12:
+                cv.create_text(x + 3, y + 2, anchor="nw", text=lab[:24],
+                               fill=TEXT, font=("Consolas", 7))
+            drawn += 1
+        ttk.Label(win, style="Dim.TLabel",
+                  text="%d of %d elements drawn   %dx%d   gold = position "
+                       "resolved by reference" % (drawn, len(boxes),
+                                                  DISPLAY_W, DISPLAY_H)
+                  ).pack(pady=(0, 8))
+        self.set_status("Screen %d: %d elements drawn." % (root, drawn))
+
     def _wheel(self):
         """Scroll whatever is under the pointer, not whatever has focus.
 
@@ -192,6 +256,7 @@ class Explorer(tk.Tk):
         ttk.Button(bar, text="Export listing...", command=self.export_tree).pack(side="left")
         ttk.Button(bar, text="Verify", command=self.verify).pack(side="left", padx=6)
         ttk.Button(bar, text="Summary", command=self.show_summary).pack(side="left")
+        ttk.Button(bar, text="View screen", command=self.show_screen).pack(side="left", padx=6)
         ttk.Label(right, text="Content", style="Title.TLabel").pack(anchor="w")
         # wrap="none" so a hex dump keeps its columns -- hence a horizontal bar
         self.hexv = self._scrolled(
@@ -330,6 +395,31 @@ class Explorer(tk.Tk):
                 iid = self.tree.insert(grp, "end", text=label[:60] or ("key %d" % did),
                                        values=("%d langs" % len(row), did))
                 self.nodes[iid] = {"_hmi_key": did, "_row": row}
+        # Screens: the drawable roots, biggest subtree first. Decoding geometry
+        # is slow enough to be worth doing once, lazily, on first use.
+        self._screens = None
+        try:
+            from .hbm5geom import Screens
+            sc = Screens(m)
+            self._screens = sc
+            found = sc.screens()
+            if found:
+                grp = self.tree.insert("", "end", text="screens/",
+                                       values=("%d" % len(found), ""))
+                for r, n in found:
+                    b = sc.box(r)
+                    # name a screen by the first label inside it -- the root is
+                    # usually an unlabelled container
+                    lab = sc.name_of(r) or ""
+                    shape = "%dx%d" % (b[2], b[3]) if b else "?"
+                    iid = self.tree.insert(
+                        grp, "end",
+                        text=(lab[:44] or "screen %d" % r) + "  [%s]" % shape,
+                        values=("%d elems" % n, r))
+                    self.nodes[iid] = {"_hmi_node": r}
+        except Exception:
+            pass                      # geometry is a bonus; strings still work
+
         plain = self.tree.insert("", "end", text="strings/",
                                  values=("%d" % len(strs), ""))
         for rid in sorted(strs):
@@ -602,6 +692,12 @@ class Explorer(tk.Tk):
             ent = self.nodes.get(iid)
             if not ent:
                 self.info.insert("end", "%s\n\n(group)\n" % name)
+                return
+            if "_hmi_node" in ent:
+                self.info.insert(
+                    "end",
+                    "screen root %d\n\nUse \"View screen\" to draw its "
+                    "elements.\n" % ent["_hmi_node"])
                 return
             if "_row" in ent:
                 self.info.insert("end", "key %d -- %d languages\n\n"

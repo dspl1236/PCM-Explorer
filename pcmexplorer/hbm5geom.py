@@ -167,6 +167,8 @@ class Screens(object):
         self.strs = self.m.strings()
         self.desc = self.m.descriptors()
         self._cache = {}
+        self._kids = None
+        self._roots = []
 
     # -- record decoding --
     def _field(self, o, ftype, depth, end):
@@ -317,10 +319,108 @@ class Screens(object):
                 out.append(rid)
         return sorted(out)
 
+    def _tree(self):
+        """parent -> [children], built from ``mParentID``.
+
+        Not from ``m_childrenIDs``.  That field is an array and does not decode
+        reliably -- it yields ids of 0 and 8, nodes listing themselves, 28,951
+        "children" for one element and 48,312 parents for another.  The parent
+        pointer is a single scalar and comes out clean: 10,259 of 10,268 resolve
+        to a real drawable, nine sit at top level, none is self-parented, and the
+        busiest node has 67 children.
+
+        The resulting roots are exactly the screen furniture you would expect --
+        an 800x80 bar at the top, an 800x364 content area at y=59, an 800x58 bar
+        at y=422 -- which is the check that this is the real linkage.
+        """
+        if self._kids is not None:
+            return self._kids
+        drawables = set(self.drawables())
+        kids, roots = {}, []
+        for rid in drawables:
+            rec = self.record(rid)
+            p = rec.get("mParentID") if rec else None
+            if isinstance(p, int) and p != rid and p in drawables:
+                kids.setdefault(p, []).append(rid)
+            else:
+                roots.append(rid)
+        for v in kids.values():
+            v.sort()
+        self._kids, self._roots = kids, sorted(roots)
+        return self._kids
+
     def children(self, rid):
-        r = self.record(rid)
-        kids = r.get("m_childrenIDs") if r else None
-        return list(kids) if isinstance(kids, list) else []
+        return list(self._tree().get(rid, ()))
+
+    def roots(self):
+        """Drawables with no resolvable parent -- the top of each screen."""
+        self._tree()
+        return list(self._roots)
+
+    def subtree(self, rid, limit=30000):
+        """Every drawable reachable from ``rid``, itself included.
+
+        Guarded rather than recursive: the graph shares nodes heavily and has
+        cycles, so a plain walk does not terminate on its own.
+        """
+        seen, stack = set(), [rid]
+        while stack and len(seen) < limit:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            stack.extend(self.children(x))
+        return seen
+
+    def screens(self, min_elements=4, limit=400):
+        """[(root_id, element_count)] -- screen-sized subtrees, biggest first.
+
+        Roots first, then any child large enough to be a screen in its own
+        right, so a full-display container and the panels inside it can both
+        be inspected.
+        """
+        self._tree()
+        out = []
+        for r in self.roots():
+            out.append((r, len(self.subtree(r))))
+        for r in self.roots():
+            for k in self.children(r):
+                n = len(self.subtree(k))
+                if n >= min_elements:
+                    out.append((k, n))
+        seen, uniq = set(), []
+        for rid, n in sorted(out, key=lambda t: -t[1]):
+            if rid in seen:
+                continue
+            seen.add(rid)
+            uniq.append((rid, n))
+            if len(uniq) >= limit:
+                break
+        return uniq
+
+    def name_of(self, rid, scan=600):
+        """A human name for a screen: the first text found inside it.
+
+        Roots are unlabelled containers, so a screen has to be named by its
+        contents.  Breadth-first, because the heading is usually nearer the top
+        of the tree than the button captions.
+        """
+        queue, seen, n = [rid], set(), 0
+        while queue and n < scan:
+            cur = queue.pop(0)
+            if cur in seen:
+                continue
+            seen.add(cur)
+            n += 1
+            t = self.label(cur)
+            if t:
+                # collapse newlines: HMI strings wrap, list rows do not
+                t = " ".join(t.split())
+                # skip format-only strings like "%1" -- they name nothing
+                if len(t) > 1 and not t.startswith("%"):
+                    return t
+            queue.extend(self.children(cur))
+        return None
 
     def stats(self):
         """How well resolution is doing -- the number to watch after a change."""
