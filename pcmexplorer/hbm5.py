@@ -86,14 +86,33 @@ def looks_like_hbm5(path):
         return False
 
 
-def read_varint(data, off):
-    """(value, next_offset).  UTF-8-shaped: 1, 2 or 3 bytes."""
+def read_varint(data, off, point=False):
+    """(value, next_offset).  UTF-8-shaped, 1 to 5 bytes.
+
+    Two schemes coexist in these files and they disagree about one range.
+    Lengths, counts, CSize and ordinary scalars use ``0x80`` as the two-byte
+    lead (``point=False``, the default).  The components of a CPoint instead
+    treat ``0x40-0x7f`` as the two-byte lead (``point=True``) -- reading a
+    CPoint with the wrong scheme is what made record geometry look like it
+    carried a variable-length prefix.
+
+    Both share ``0xc0-0xef`` for the three-byte form and an ``0xf0`` escape
+    carrying four raw big-endian bytes.
+    """
     b = data[off]
+    if b == 0xF0:                       # escape: four raw big-endian bytes
+        return (int.from_bytes(data[off + 1:off + 5], "big"), off + 5)
+    if 0xC0 <= b <= 0xEF:
+        return ((b & 0x3F) << 16) | (data[off + 1] << 8) | data[off + 2], off + 3
+    if point:
+        if 0x40 <= b <= 0x7F:
+            return ((b & 0x3F) << 8) | data[off + 1], off + 2
+        if b < 0x40:
+            return b, off + 1
+        return ((b & 0x3F) << 8) | data[off + 1], off + 2
     if b < 0x80:
         return b, off + 1
-    if (b & 0xC0) == 0x80:
-        return ((b & 0x3F) << 8) | data[off + 1], off + 2
-    return ((b & 0x3F) << 16) | (data[off + 1] << 8) | data[off + 2], off + 3
+    return ((b & 0x3F) << 8) | data[off + 1], off + 2
 
 
 class Hbm5File(object):
