@@ -8,6 +8,7 @@ from .core import (DiskImage, build_paths, hexdump, human, is_dir, is_link,
                    mode_str, safe_name)
 from .decode import preview, summarise_disk, summarise_firmware
 from .firmware import FirmwareImage, looks_like_ifs
+from .efs import EfsImage, looks_like_efs, summarise_efs
 from .updatedisc import UpdateDisc, looks_like_update_disc, summarise_update
 
 USAGE = """PCM Explorer -- browse a Porsche PCM / Audi MMI hard-drive image.
@@ -31,6 +32,17 @@ Update discs (a .ISO, or an already-extracted disc folder):
   pcm-explorer <disc> crc                   verify every CRC32 against its payload
   pcm-explorer <disc> sigs                  signature inventory
   pcm-explorer <disc> files [pattern]       list files on the disc
+  pcm-explorer <disc> cat <path>            print a file from the disc
+  pcm-explorer <disc> extract <path> <dest> pull a file or the whole disc out
+
+Persistence images (PCM3_HBpersistence.efs and MMI efs-system.efs) open the
+same way -- summary, ls, cat, extract.
+
+Compare any two of the above:
+
+  pcm-explorer diff <a> <b>                 what changed between them
+  pcm-explorer diff old.ifs new.ifs         between two firmware builds
+  pcm-explorer diff ./car_hbp PCM3_HBpersistence.efs    a car vs the factory
 
 Accepts a raw disk image, a firmware image (PCM3_IFS1.ifs / PCM3_IFS2.ifs),
 or a PCM 3.1 update disc.
@@ -276,6 +288,55 @@ def _disc_cmd(disc, cmd, a):
                   "private key.")
         return 0
 
+    if cmd == "cat":
+        if not a:
+            print("usage: cat <path>")
+            return 1
+        data = disc.read(a[0])
+        if data is None:
+            # tolerate a bare filename rather than the full disc path
+            hits = [p for p in disc.files() if p.rsplit("/", 1)[-1] == a[0]]
+            if len(hits) == 1:
+                data = disc.read(hits[0])
+            elif len(hits) > 1:
+                print("ambiguous -- %d files named %s:" % (len(hits), a[0]))
+                for h in hits[:10]:
+                    print("   %s" % h)
+                return 1
+        if data is None:
+            print("not on this disc: %s" % a[0])
+            return 1
+        try:
+            sys.stdout.buffer.write(data)
+        except Exception:
+            print(data.decode("latin-1", "replace"))
+        return 0
+
+    if cmd == "extract":
+        if not a:
+            print("usage: extract <path|all> <dest>")
+            return 1
+        dest = a[1] if len(a) > 1 else "."
+        want = disc.files() if a[0] in ("all", "/") else \
+            [p for p in disc.files() if p == a[0] or p.startswith(a[0].rstrip("/") + "/")
+             or p.rsplit("/", 1)[-1] == a[0]]
+        if not want:
+            print("nothing matches: %s" % a[0])
+            return 1
+        n = 0
+        for p in want:
+            data = disc.read(p)
+            if data is None:
+                continue
+            rel = p.lstrip("/").replace("/", os.sep)
+            out = os.path.join(dest, rel)
+            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+            with open(out, "wb") as f:
+                f.write(data)
+            n += 1
+        print("extracted %d file%s to %s" % (n, "" if n == 1 else "s", dest))
+        return 0
+
     if cmd == "files":
         pat = a[0].lower() if a else None
         n = 0
@@ -289,8 +350,27 @@ def _disc_cmd(disc, cmd, a):
         return 0
 
     print("unknown update-disc command: %s" % cmd)
-    print("try: summary, units, modules, crc, sigs, files")
+    print("try: summary, units, modules, crc, sigs, files, cat, extract")
     return 1
+
+
+def cmd_diff(argv):
+    """Compare two readable things and report what differs."""
+    from .diffimg import compare, format_report, open_side
+    if len(argv) < 2:
+        print("usage: diff <a> <b>")
+        print("  each side may be a folder, .ifs firmware, .efs persistence")
+        print("  image, an update disc (.iso or folder), or a disk image")
+        return 1
+    try:
+        a = open_side(argv[0])
+        b = open_side(argv[1])
+    except Exception as e:
+        print("could not open: %s" % e)
+        return 1
+    added, removed, changed, same, by_name = compare(a, b)
+    print(format_report(a, b, added, removed, changed, same, by_name))
+    return 0
 
 
 def main(argv):
@@ -305,6 +385,10 @@ def main(argv):
         print("PCM Explorer %s\n" % version_string())
         print(USAGE)
         return 0
+    # diff takes two operands rather than an image plus a verb
+    if argv[0] == "diff":
+        return cmd_diff(argv[1:])
+
     path = argv[0]
     # a directory is only meaningful as an extracted update-disc tree
     if not os.path.isfile(path) and not os.path.isdir(path):
@@ -333,13 +417,17 @@ def main(argv):
         print("not a file: %s" % path)
         return 1
 
-    # A firmware image is a different container but browses the same way.
-    if looks_like_ifs(path):
+    # A firmware image or an EFS persistence image is a different container but
+    # browses the same way -- same entry shape, so one code path serves both.
+    if looks_like_ifs(path) or looks_like_efs(path):
         try:
-            fw = FirmwareImage(path)
+            fw = EfsImage(path) if looks_like_efs(path) else FirmwareImage(path)
         except Exception as e:
             print("not a readable firmware image: %s" % e)
             return 1
+        if isinstance(fw, EfsImage) and cmd in ("parts", "summary"):
+            print(summarise_efs(fw))
+            return 0
         a = argv[2:]
         if cmd in ("parts", "summary"):
             print(summarise_firmware(fw))

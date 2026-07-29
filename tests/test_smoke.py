@@ -16,6 +16,8 @@ from pcmexplorer.core import (DiskImage, RootNode, hexdump, human, mode_str,
                               parse_dirents_raw, BLKOFF, QNX6_MAGIC)
 from pcmexplorer.decode import decode_cvalue, preview, odometer_from_logbook
 from pcmexplorer.firmware import looks_like_ifs, QNX_STARTUP_MAGIC, IFS2_LZO_OFFSET
+from pcmexplorer.efs import EfsImage, looks_like_efs
+from pcmexplorer.diffimg import compare, format_report, open_side
 from pcmexplorer.updatedisc import (FLASH_MAP, UpdateDisc, looks_like_update_disc,
                                     parse_crc_record, parse_def, signature_kind,
                                     summarise_update)
@@ -274,6 +276,71 @@ CONTROL
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_efs_detect():
+    print("\nEFS persistence images")
+    path = os.path.join(tempfile.gettempdir(), "pcmx_fake.efs")
+    with open(path, "wb") as f:                    # QSSL_F3S marks an F3S image
+        f.write(bytes(0x2c) + b"QSSL_F3S" + bytes(0x100))
+    try:
+        check("looks_like_efs() accepts a QSSL_F3S header", looks_like_efs(path))
+    finally:
+        os.remove(path)
+    junk = os.path.join(tempfile.gettempdir(), "pcmx_notefs.bin")
+    with open(junk, "wb") as f:
+        f.write(bytes(0x200))
+    try:
+        check("looks_like_efs() rejects a blank blob", not looks_like_efs(junk))
+    finally:
+        os.remove(junk)
+    check("erase-slack threshold is set", EfsImage.ERASE_RUN >= 16,
+          str(EfsImage.ERASE_RUN))
+    check("extent alignment is 4", EfsImage.ALIGN == 4)
+
+
+def test_diff():
+    print("\ndiff")
+    root = os.path.join(tempfile.gettempdir(), "pcmx_diff")
+    a = os.path.join(root, "a")
+    b = os.path.join(root, "b")
+    for d in (a, b):
+        os.makedirs(d, exist_ok=True)
+    try:
+        with open(os.path.join(a, "same.txt"), "wb") as f:
+            f.write(b"identical")
+        with open(os.path.join(b, "same.txt"), "wb") as f:
+            f.write(b"identical")
+        with open(os.path.join(a, "edited.txt"), "wb") as f:
+            f.write(b"before")
+        with open(os.path.join(b, "edited.txt"), "wb") as f:
+            f.write(b"after!")
+        with open(os.path.join(a, "gone.txt"), "wb") as f:
+            f.write(b"only in a")
+        with open(os.path.join(b, "new.txt"), "wb") as f:
+            f.write(b"only in b")
+        # a file that differs ONLY by flash alignment padding must read as same
+        with open(os.path.join(a, "padded.bin"), "wb") as f:
+            f.write(b"payload")
+        with open(os.path.join(b, "padded.bin"), "wb") as f:
+            f.write(b"payload\xff\xff")
+
+        sa, sb = open_side(a), open_side(b)
+        added, removed, changed, same, by_name = compare(sa, sb)
+        check("identical files match", same == 2, "got %d" % same)
+        check("edited file detected",
+              [c[0] for c in changed] == ["/edited.txt"], str(changed))
+        check("removal detected", [r[0] for r in removed] == ["/gone.txt"],
+              str(removed))
+        check("addition detected", [x[0] for x in added] == ["/new.txt"],
+              str(added))
+        check("0xFF alignment padding is not a difference",
+              all(c[0] != "/padded.bin" for c in changed))
+        rep = format_report(sa, sb, added, removed, changed, same, by_name)
+        check("report renders", "CHANGED" in rep and "ONLY IN A" in rep)
+        check("path matching used when both sides have paths", not by_name)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_version():
     print("\nversion reporting")
     import pcmexplorer
@@ -311,6 +378,8 @@ def main():
     test_decoders()
     test_firmware_detect()
     test_update_disc()
+    test_efs_detect()
+    test_diff()
     test_version()
     test_real_image_if_present()
     print("\n%s" % ("ALL PASSED" if not _fails
