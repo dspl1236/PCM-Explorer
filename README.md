@@ -32,8 +32,12 @@ python explorer.py moccaV2Target.mmi                  # the HMI itself
 python explorer.py moccaV2Target.mmi langs            # every string, every language
 python explorer.py moccaV2Target.mmi screens 33616    # a screen's elements, x/y/w/h
 
+python explorer.py grep disk.img Burmester P2         # which file mentions this?
+python explorer.py grep PCM3_IFS2.ifs --hex 48424d35  # or a byte pattern (HBM5)
+
 python explorer.py diff old.ifs new.ifs               # what changed between builds
-python explorer.py diff ./car_hbp PCM3_HBpersistence.efs   # a car vs the factory
+python explorer.py stock ./car_hbp "D:/PCM/ISO Extract"    # what is not factory
+python explorer.py report disk.img unit.html          # one page you can send
 ```
 
 ## What it does
@@ -54,8 +58,17 @@ python explorer.py diff ./car_hbp PCM3_HBpersistence.efs   # a car vs the factor
   `.mmi` files. Every string the unit can display in all nine languages — ten on the
   instrument cluster, which is the only place Chinese appears — and the screens, with
   real element geometry on an 800×480 display.
+- **Searches file contents**, not just names — across a partition, a firmware image, a
+  disc or a folder. Text patterns are tried as UTF-8 *and* UTF-16LE, because firmware
+  carries both; hex patterns are there for hunting structures rather than words.
 - **Compares any two of them.** `diff` works across kinds: two firmware builds, or a
   car's exported `/HBpersistence` folder against the factory flash image.
+- **Answers "what on this unit is not factory"** in one step. The baseline lives in a
+  `.efs` inside whichever release matches the car — `stock` finds it, and since a disc
+  carries fourteen candidates it scores each against the unit rather than guessing.
+- **Writes one shareable HTML page** about an image: what it is, whether each partition
+  read cleanly, what is non-stock, and the bootscreens inlined. Self-contained, so it
+  attaches to a forum post and still works.
 - **Decodes what it finds** — `CVALUE*.CVA` coding tables, the odometer inside the
   driver's-logbook database, ELF architecture, PNG dimensions.
 - **Maps the partitions** and identifies the filesystem in each — **QNX6 and QNX4** — reading
@@ -151,6 +164,34 @@ presentational. There is no screen, menu, button, event or transition class, bec
 flow is compiled into `PCM3Reload` rather than stored as data. A wireframe is still enough
 to recognise a screen and to lay out a custom one that matches the OEM metrics — list rows
 are 664×69, buttons 66×57, the content area 800×364 at y=59.
+
+## Is this unit stock?
+
+The question most people actually have, and it used to take three steps of tribal
+knowledge: know that the factory `/HBpersistence` lives in a `.efs` at flash address
+`0x03000000`, know it sits inside whichever release matches the car, extract it, then
+diff. Now:
+
+```
+python explorer.py stock ./exported_hbpersistence "D:/PCM/ISO Extract"
+```
+
+A disc carries a baseline per release — fourteen on the 2015 field-update disc — so
+picking the first one is a coin toss dressed as an answer. It scores every candidate
+against the unit and reports which it used:
+
+```
+baseline: /PCM31RDW400/HEADUNIT/ADR3000000/PCM3_HBpersistence.efs  (best of 14, 54 files identical)
+
+  identical to factory         54
+  modified                      9
+  added (not in factory)       91
+  missing (factory has it)     22
+```
+
+On a test comparison, taking the first match chose the **Arabic v3** baseline and
+reported 31 files identical; scoring chose **RDW v4** and reported 54. Both look
+entirely plausible in isolation, which is exactly why the tool shows its working.
 
 ## Salvage mode
 

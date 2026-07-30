@@ -479,16 +479,28 @@ def cmd_grep(argv):
         print("       -i        case-insensitive")
         print("       --in STR  only files whose path contains STR")
         return 1
-    target, pattern = argv[0], argv[1]
-    rest = argv[2:]
-    mode = "hex" if "--hex" in rest else "both"
-    ignore_case = "-i" in rest
-    path_filter = None
-    if "--in" in rest:
-        i = rest.index("--in")
-        if i + 1 < len(rest):
-            path_filter = rest[i + 1]
-    part = next((a for a in rest if re.match(r"^[PL]\d+$", a)), None)
+    # Pull the flags out wherever they appear, then take what is left
+    # positionally -- otherwise "grep img --hex 4142" uses "--hex" as the
+    # pattern, which fails by finding nothing rather than by complaining.
+    args, mode, ignore_case, path_filter = [], "both", False, None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--hex":
+            mode = "hex"
+        elif a == "-i":
+            ignore_case = True
+        elif a == "--in" and i + 1 < len(argv):
+            i += 1
+            path_filter = argv[i]
+        else:
+            args.append(a)
+        i += 1
+    if len(args) < 2:
+        print("usage: grep <target> <pattern> [part] [--hex] [-i] [--in STR]")
+        return 1
+    target, pattern = args[0], args[1]
+    part = next((a for a in args[2:] if re.match(r"^[PL]\d+$", a)), None)
 
     try:
         side = open_side(target, part)
