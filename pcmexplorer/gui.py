@@ -125,6 +125,39 @@ class Explorer(tk.Tk):
                   ).pack(pady=(0, 8))
         self.set_status("Screen %d: %d elements drawn." % (root, drawn))
 
+    def _show_image(self, data, nbytes=None):
+        """Draw the file in the content pane if it is a picture.  True if shown.
+
+        Identified by magic, so a bootscreen named ``.bin`` still renders. The
+        PhotoImage is kept on self -- Tk does not own it, and letting Python
+        collect it leaves an empty pane with no error.
+        """
+        from .images import describe, raw_candidates, to_photoimage
+        n = nbytes if nbytes is not None else len(data)
+        raw = None
+        if not describe(data):
+            cands = raw_candidates(n)
+            if not cands:
+                return False
+            raw = cands[0]
+        photo = to_photoimage(data, tk, raw_size=raw)
+        if photo is None:
+            what = describe(data, n)
+            if what and "JPEG" in what:
+                self.hexv.insert(
+                    "end", "%s\n\n(JPEG needs Pillow to display; install it with\n"
+                           " pip install pillow\nThe file itself extracts fine.)\n"
+                           % what)
+                return True
+            return False
+        self._photo = photo                     # keep a reference or it vanishes
+        self.hexv.insert("end", " ")
+        self.hexv.image_create("end", image=photo)
+        self.hexv.insert("end", "\n\n%s   %dx%d\n"
+                         % (describe(data, n) or "image",
+                            photo.width(), photo.height()))
+        return True
+
     def _wheel(self):
         """Scroll whatever is under the pointer, not whatever has focus.
 
@@ -749,6 +782,10 @@ class Explorer(tk.Tk):
             txt = preview(self._path_of(iid), data)
         except Exception:
             txt = None
+        if self._show_image(data, inode.get("size", len(data))):
+            if txt:
+                self.hexv.insert("end", "\n" + txt)
+            return
         if txt is not None:
             self.hexv.insert("end", txt)
         elif _printable_ratio(data[:512]) > 0.9:

@@ -129,11 +129,12 @@ def preview(path, data, limit=4000):
         machine = struct.unpack_from("<H", data, 18)[0] if len(data) > 20 else 0
         arch = {42: "SuperH (SH4)", 3: "x86", 40: "ARM"}.get(machine, "machine %d" % machine)
         return "ELF executable, %s, %s" % (arch, human(len(data)))
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        if len(data) > 24:
-            w, h = struct.unpack_from(">II", data, 16)
-            return "PNG image, %dx%d, %s" % (w, h, human(len(data)))
-        return "PNG image"
+    # By magic, not by extension: the custom bootscreens are called
+    # CustomBootscreen_NNN.bin and are JPEGs.
+    from .images import describe as _describe_image
+    img = _describe_image(data)
+    if img:
+        return "%s, %s" % (img, human(len(data)))
     if _printable(data[:200].replace(b"\n", b" ").replace(b"\r", b" ").replace(b"\t", b" ")):
         return data[:limit].decode("latin-1")
     return None

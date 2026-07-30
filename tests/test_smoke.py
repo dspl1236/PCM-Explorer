@@ -20,6 +20,8 @@ from pcmexplorer.efs import EfsImage, looks_like_efs
 from pcmexplorer.hbm5 import Hbm5File, looks_like_hbm5, read_varint
 from pcmexplorer.hbm5geom import (ANCHOR_KINDS, DISPLAY_H, DISPLAY_W,
                                   _varint as _gvarint)
+from pcmexplorer.images import (bmp_to_ppm, describe, identify,
+                                raw_candidates, rgb565_to_ppm)
 from pcmexplorer.diffimg import compare, format_report, open_side
 from pcmexplorer.updatedisc import (FLASH_MAP, UpdateDisc, disc_root,
                                     looks_like_update_disc,
@@ -167,7 +169,9 @@ def test_decoders():
 
     elf = b"\x7fELF" + bytes(14) + struct.pack("<H", 42) + bytes(40)
     check("preview() identifies an SH4 ELF", "SuperH" in (preview("/x", elf) or ""))
-    png = b"\x89PNG\r\n\x1a\n" + bytes(8) + struct.pack(">II", 640, 480) + bytes(8)
+    # a real PNG carries the IHDR chunk at offset 12; the identifier requires it
+    png = (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" +
+           struct.pack(">II", 640, 480) + bytes(8))
     check("preview() identifies a PNG", "640x480" in (preview("/x.png", png) or ""))
     check("preview() passes text through",
           "hello" in (preview("/x.txt", b"hello world") or ""))
@@ -450,6 +454,56 @@ def test_hbm5_geom():
     check("anchor kinds are the left/right pair", ANCHOR_KINDS == (21, 22))
 
 
+def test_images():
+    print("\nimage recognition")
+    png = b"\x89PNG\r\n\x1a\n" + bytes(4) + b"IHDR" + struct.pack(">II", 800, 480)
+    check("PNG identified with size", identify(png) == ("PNG", 800, 480),
+          str(identify(png)))
+    gif = b"GIF89a" + struct.pack("<HH", 64, 32)
+    check("GIF identified", identify(gif) == ("GIF", 64, 32), str(identify(gif)))
+    # SOF0 frame header: ff c0, len, precision, height, width
+    jpg = (b"\xff\xd8\xff\xe0" + struct.pack(">H", 16) + b"JFIF" + bytes(10) +
+           b"\xff\xc0" + struct.pack(">H", 17) + b"\x08" +
+           struct.pack(">HH", 480, 800) + bytes(6))
+    check("JPEG size read from the frame header",
+          identify(jpg) == ("JPEG", 800, 480), str(identify(jpg)))
+    check("random bytes are not an image", identify(b"not an image at all") is None)
+
+    # ★ extensions lie: the bootscreens are called .bin and are real images
+    check("describe() ignores the filename",
+          (describe(png) or "").startswith("PNG image"), describe(png))
+
+    # 2x2 24-bit BMP, bottom-up, one red pixel top-left
+    px = bytearray()
+    for _ in range(2):                       # bottom row
+        px += bytes((0, 0, 0))
+    px += bytes(2)                           # pad to 4-byte stride
+    px += bytes((0, 0, 255)) + bytes((0, 0, 0)) + bytes(2)   # top row: BGR red
+    hdr = (b"BM" + struct.pack("<IHHI", 54 + len(px), 0, 0, 54) +
+           struct.pack("<IiiHHIIiiII", 40, 2, 2, 1, 24, 0, len(px), 0, 0, 0, 0))
+    bmp = hdr + bytes(px)
+    check("BMP identified", identify(bmp) == ("BMP", 2, 2), str(identify(bmp)))
+    ppm = bmp_to_ppm(bmp)
+    check("BMP decodes to PPM", ppm is not None and ppm.startswith(b"P6\n2 2\n255\n"),
+          repr(ppm[:16]) if ppm else "None")
+    # the file stores bottom row first, so after flipping the red pixel that
+    # was written last must come out first, and BGR must have become RGB
+    check("BMP rows are flipped to top-down and BGR swapped",
+          ppm is not None and ppm[11:14] == bytes((255, 0, 0)),
+          repr(ppm[11:14]) if ppm else "-")
+
+    # raw RGB565: full-scale must reach 255, not 248
+    raw = struct.pack("<H", 0xFFFF) + struct.pack("<H", 0x0000)
+    ppm = rgb565_to_ppm(raw, 2, 1)
+    check("RGB565 white expands to full range",
+          ppm is not None and ppm.endswith(bytes((255, 255, 255, 0, 0, 0))),
+          repr(ppm[-6:]) if ppm else "-")
+    check("raw framebuffer size recognised",
+          raw_candidates(800 * 480 * 2) == [(800, 480)],
+          str(raw_candidates(800 * 480 * 2)))
+    check("a wrong size is not a framebuffer", raw_candidates(12345) == [])
+
+
 def test_version():
     print("\nversion reporting")
     import pcmexplorer
@@ -491,6 +545,7 @@ def main():
     test_diff()
     test_hbm5()
     test_hbm5_geom()
+    test_images()
     test_version()
     test_real_image_if_present()
     print("\n%s" % ("ALL PASSED" if not _fails
