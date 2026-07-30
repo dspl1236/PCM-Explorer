@@ -67,19 +67,32 @@ ARRAY = 0xA1
 # Kinds seen on a position descriptor: a left/right anchor pair.
 ANCHOR_KINDS = (21, 22)
 
+# A field's CUID is hashed with its *class* CUID as the seed, so the same field
+# name has a different hash in every class that declares it. These two groups
+# therefore coexist rather than conflict: the drawable hierarchy below, and the
+# resource classes it points at.
 CLASS_NAMES = {
+    # drawables
     0x8E2F8293: "CDrawObject",          0x90AA9E70: "CGUIElement",
     0xA806B8EE: "CAligningObject",      0xA3C213B8: "CBitmapObject",
     0x71B5DB06: "CTextBase",            0x3EBA6425: "CTextObject",
     0xBA066794: "CFormattedTextObject", 0x77F80FB9: "CTextArea",
+    0x2267FE33: "<CPoint>",             0x0AA3495D: "<CSize>",
+    # resources
     0xDA63396B: "CDisplay",             0x92AE6BAD: "CColor",
     0x57E931C3: "CAlignment",           0xC6D7DD90: "CBitmap",
     0xE0D04503: "CFontFormat",          0x0B60D4CA: "CFontFile",
-    0x5C8F9492: "CResourceTable",       0x25B3AC9A: "<string>",
-    0x2267FE33: "<CPoint>",             0x0AA3495D: "<CSize>",
+    0x5C8F9492: "CResourceTable",       0x25B3AC9A: "CHBString",
+    0x60436E39: "CFont",                0x8AC3362F: "CFontReferences",
+    0x2F71594A: "CFontTextCombination", 0xE161265A: "CPlacementFontCombination",
+    0x3DC09477: "CPlacementCombination", 0xB9106E94: "CBitmapColorCombination",
+    0xD7CE702B: "CColors",              0xD8492763: "CColorMasks",
+    0x1F53E9FF: "CColorReferences",     0x833EFC17: "PositionResource",
+    0x8425447B: "AlignmentResource",
 }
 
 FIELD_NAMES = {
+    # on the drawable classes
     0x0A2B4963: "mParentID",       0x7F9A5557: "mDrawOrder",
     0x7A1CC624: "mPositionResID",  0xF790B5F2: "mSizeResID",
     0xEBD70139: "mPosition",       0x45CF85C4: "mSize",
@@ -87,7 +100,28 @@ FIELD_NAMES = {
     0x5A894D17: "mAlignmentResID", 0x79CC0437: "mAlignment",
     0x94EA844C: "mBmpResID",       0xF9F3B843: "mColorsResID",
     0xD7C9A631: "mTextResID",      0xB397877F: "mFontResID",
-    0x9960974E: "point",           0x26693065: "size",
+    0x621C612D: "mFontResID",      0x9960974E: "point",
+    0x26693065: "size",
+    # on CFont / CFontFormat / CFontFile -- the chain a label's size comes from
+    0xAFB73BC7: "mFontFormatResID", 0x650043A0: "mColorsResID",
+    0x84477324: "mFontFileResID",   0xA2E58771: "mHeight",
+    0xD080B74E: "mWidth",           0xEE757E54: "mEngine",
+    0x92DD65C3: "mHorizontalDPI",   0x2E858ACE: "mVerticalDPI",
+    0x70160B06: "mFileName",        0xFFF5F83A: "mOutlineWidth",
+    0x1EB8A8EF: "mFontResID",       0x5F028ED0: "mFontResID",
+    0x5F90203A: "mFonts",           0x5C8C1726: "mString",
+    # on CBitmap
+    0xEC9570D7: "mMode",            0x93DF2ACC: "mBitsPerPixel",
+    0x78BDA50A: "mWidth",           0xE70B5DA7: "mHeight",
+    0x0800845E: "mPaletteCount",    0x9A979BD7: "mPixelData",
+    # on the resource-side placement classes
+    0x8F1AC150: "mPoint",           0xC0654178: "mSize",
+    0x10432267: "mPosition",        0x2B5B2DE3: "mSize",
+    0xE4E168FB: "mPositionResID",   0xD967BDC7: "mSizeResID",
+    0xE46C3005: "mBmpResID",        0x98165484: "mTextResID",
+    0xA433A1BF: "mColorsResID",     0xF1BF6A3D: "mParentID",
+    0xA3EFFD51: "m_childrenIDs",    0xD0B3623F: "m_resourceTableID",
+    0x516D5D62: "mDrawOrder",
 }
 
 
@@ -397,6 +431,58 @@ class Screens(object):
             if len(uniq) >= limit:
                 break
         return uniq
+
+    def font_px(self, rid):
+        """Pixel height of the font an element draws in, or None.
+
+        The chain is element -> mFontResID -> CFont -> mFontFormatResID ->
+        CFontFormat.mHeight, and CFontFormat also names the .ttf via CFontFile,
+        so the real typeface is knowable too -- the files are in IFS2.  Using the
+        recorded size rather than one fixed size is what stops every screen
+        looking alike: a heading and a list row differ by more than their text.
+        """
+        r = self.record(rid)
+        if not r:
+            return None
+        fid = r.get("mFontResID") or 0
+        if not fid:
+            return None
+        f = self.record(fid)
+        if f is None:                       # a descriptor: follow its variants
+            for _kind, pid in self.desc.get(fid, ()):
+                f = self.record(pid)
+                if f is not None:
+                    break
+        if not f:
+            return None
+        ffid = f.get("mFontFormatResID") or 0
+        fmt = self.record(ffid) if ffid else None
+        if fmt is None and ffid:
+            for _kind, pid in self.desc.get(ffid, ()):
+                fmt = self.record(pid)
+                if fmt is not None:
+                    break
+        h = (fmt or {}).get("mHeight")
+        if isinstance(h, int) and 4 <= h <= 96:
+            return h
+        return None
+
+    def font_file(self, rid):
+        """The .ttf an element's font resolves to, if the chain is complete."""
+        r = self.record(rid)
+        fid = (r or {}).get("mFontResID") or 0
+        f = self.record(fid) if fid else None
+        ffid = (f or {}).get("mFontFormatResID") or 0
+        fmt = self.record(ffid) if ffid else None
+        fileid = (fmt or {}).get("mFontFileResID") or 0
+        ff = self.record(fileid) if fileid else None
+        name = (ff or {}).get("mFileName")
+        if isinstance(name, bytes):
+            try:
+                return name.decode("utf-8", "replace").strip("\x00")
+            except Exception:
+                return None
+        return name if isinstance(name, str) else None
 
     def name_of(self, rid, scan=600):
         """A human name for a screen: the first text found inside it.

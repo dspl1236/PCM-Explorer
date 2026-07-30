@@ -1,5 +1,6 @@
 """Command-line interface -- everything the GUI does, scriptable."""
 import os
+import re
 import sys
 
 from . import version_string
@@ -46,6 +47,21 @@ HMI definitions (.mmi) hold the screens and every string the unit can display:
   pcm-explorer <x.mmi> langs [pattern]      keys resolved across all languages
   pcm-explorer <x.mmi> verify               container self-check
   pcm-explorer <x.mmi> screens [root]       drawables resolved to x/y/w/h
+
+Search contents across any of the above:
+
+  pcm-explorer grep <target> <pattern> [part]   which files contain this?
+  pcm-explorer grep disk.img Burmester P2
+  pcm-explorer grep PCM3_IFS1.ifs --hex 89504e47
+
+One shareable HTML page about an image:
+
+  pcm-explorer report disk.img
+  pcm-explorer report disk.img unit.html "D:/PCM/ISO Extract"
+
+What is non-stock on a unit -- the baseline is found inside the disc for you:
+
+  pcm-explorer stock ./car_hbpersistence "D:/PCM/ISO Extract"
 
 Compare any two of the above:
 
@@ -453,6 +469,129 @@ def _hbm5_cmd(m, cmd, a):
     return 1
 
 
+def cmd_grep(argv):
+    """Search file contents across any openable artifact."""
+    from .diffimg import open_side
+    from .search import as_patterns, format_hits, search_side
+    if len(argv) < 2:
+        print("usage: grep <image|firmware|efs|disc|folder> <pattern> [part]")
+        print("       --hex     pattern is hex bytes, e.g. 89504e47")
+        print("       -i        case-insensitive")
+        print("       --in STR  only files whose path contains STR")
+        return 1
+    target, pattern = argv[0], argv[1]
+    rest = argv[2:]
+    mode = "hex" if "--hex" in rest else "both"
+    ignore_case = "-i" in rest
+    path_filter = None
+    if "--in" in rest:
+        i = rest.index("--in")
+        if i + 1 < len(rest):
+            path_filter = rest[i + 1]
+    part = next((a for a in rest if re.match(r"^[PL]\d+$", a)), None)
+
+    try:
+        side = open_side(target, part)
+        patterns = as_patterns(pattern, mode, ignore_case)
+    except Exception as e:
+        print("could not search: %s" % e)
+        return 1
+
+    print("searching %s (%s, %d files) for %r\n"
+          % (side.label, side.kind, len(side.index), pattern))
+    nf = nh = 0
+    for path, hits in search_side(side, patterns, ignore_case, path_filter):
+        print(format_hits(path, hits))
+        nf += 1
+        nh += len(hits)
+    print("\n%d hit%s in %d file%s"
+          % (nh, "" if nh == 1 else "s", nf, "" if nf == 1 else "s"))
+    return 0 if nf else 1
+
+
+def cmd_report(argv):
+    """One shareable HTML page describing an image."""
+    from .report import build
+    if not argv:
+        print("usage: report <image> [out.html] [update disc or .efs]")
+        print("  A self-contained page: what the image is, whether it read")
+        print("  cleanly, and -- with a baseline -- what on it is not stock.")
+        return 1
+    src = argv[0]
+    out = argv[1] if len(argv) > 1 else os.path.splitext(
+        os.path.basename(src))[0] + "-report.html"
+    baseline = argv[2] if len(argv) > 2 else None
+    try:
+        path = build(src, out, baseline)
+    except Exception as e:
+        print("could not build the report: %s" % e)
+        return 1
+    print("wrote %s (%s)" % (path, human(os.path.getsize(path))))
+    return 0
+
+
+def cmd_stock(argv):
+    """What on this unit differs from factory?"""
+    from .diffimg import compare, find_baseline, open_side
+    if len(argv) < 2:
+        print("usage: stock <exported /HBpersistence folder> <update disc or .efs>")
+        print("  Compares a unit against the factory baseline and reports what")
+        print("  has been added, removed or changed. The baseline is found for")
+        print("  you inside the disc.")
+        return 1
+    target, ref = argv[0], argv[1]
+    try:
+        mine = open_side(target)
+    except Exception as e:
+        print("could not open %s: %s" % (target, e))
+        return 1
+
+    label, base = None, None
+    if os.path.isdir(ref) or ref.lower().endswith(".iso"):
+        try:
+            label, base = find_baseline(ref, against=mine)
+        except Exception as e:
+            print("could not read the disc: %s" % e)
+            return 1
+        if base is None:
+            print("no factory persistence image found in %s" % ref)
+            return 1
+        print("baseline: %s" % label)
+    else:
+        try:
+            base = open_side(ref)
+        except Exception as e:
+            print("could not open %s: %s" % (ref, e))
+            return 1
+
+    added, removed, changed, same, by_name = compare(base, mine)
+    print("\n%s vs factory\n" % mine.label)
+    print("  %-28s %d" % ("identical to factory", same))
+    print("  %-28s %d" % ("modified", len(changed)))
+    print("  %-28s %d" % ("added (not in factory)", len(added)))
+    print("  %-28s %d" % ("missing (factory has it)", len(removed)))
+    if by_name:
+        print("\n  matched on file name -- the flash image carries no directory")
+        print("  structure, so same-named files in different folders merge.")
+
+    def block(title, rows, fmt):
+        if not rows:
+            return
+        print("\n%s" % title)
+        for r in rows[:30]:
+            print("   " + fmt(r))
+        if len(rows) > 30:
+            print("   ... and %d more" % (len(rows) - 30))
+
+    block("MODIFIED", changed,
+          lambda r: "%-44s %8d -> %d" % (r[0][:44], r[1], r[3]))
+    block("ADDED", added, lambda r: "%-44s %8d" % (r[0][:44], r[1]))
+    block("MISSING", removed, lambda r: "%-44s %8d" % (r[0][:44], r[1]))
+    if not (changed or added or removed):
+        print("\nNothing differs from factory.")
+    return 0
+
+
 def cmd_diff(argv):
     """Compare two readable things and report what differs."""
     from .diffimg import compare, format_report, open_side
@@ -487,6 +626,12 @@ def main(argv):
     # diff takes two operands rather than an image plus a verb
     if argv[0] == "diff":
         return cmd_diff(argv[1:])
+    if argv[0] == "grep":
+        return cmd_grep(argv[1:])
+    if argv[0] == "stock":
+        return cmd_stock(argv[1:])
+    if argv[0] == "report":
+        return cmd_report(argv[1:])
 
     path = argv[0]
     # a directory is only meaningful as an extracted update-disc tree

@@ -22,6 +22,8 @@ from pcmexplorer.hbm5geom import (ANCHOR_KINDS, DISPLAY_H, DISPLAY_W,
                                   _varint as _gvarint)
 from pcmexplorer.images import (bmp_to_ppm, describe, identify,
                                 raw_candidates, rgb565_to_ppm)
+from pcmexplorer.search import as_patterns, search_bytes
+from pcmexplorer.report import build as build_report
 from pcmexplorer.diffimg import compare, format_report, open_side
 from pcmexplorer.updatedisc import (FLASH_MAP, UpdateDisc, disc_root,
                                     looks_like_update_disc,
@@ -504,6 +506,63 @@ def test_images():
     check("a wrong size is not a framebuffer", raw_candidates(12345) == [])
 
 
+def test_search():
+    print("\ncontent search")
+    pats = as_patterns("abc", "both")
+    check("a text pattern searches UTF-8 and UTF-16",
+          [p for _l, p in pats] == [b"abc", b"a\x00b\x00c\x00"], str(pats))
+    check("hex pattern decodes", as_patterns("89504e47", "hex")[0][1] == b"\x89PNG",
+          str(as_patterns("89504e47", "hex")))
+    check("odd-length hex is rejected",
+          _raises(lambda: as_patterns("abc", "hex")))
+
+    # padded with text, not NULs -- a context window that is half zeros is
+    # correctly reported as hex, which would be testing the wrong branch
+    data = b"the quick BROWN fox jumps over the lazy dog, brown again"
+    hits = search_bytes(data, as_patterns("brown", "utf-8"))
+    check("case-sensitive by default", len(hits) == 1, str(hits))
+    hits = search_bytes(data, as_patterns("brown", "utf-8", True), ignore_case=True)
+    check("case-insensitive finds both", len(hits) == 2, str(hits))
+    check("offset is reported", hits[0][0] == 10, str(hits[0]))
+    check("text context is readable", "quick" in hits[0][2], hits[0][2])
+
+    # a hit inside binary data should come back as hex, not mojibake
+    binary = bytes(range(0, 32)) * 3 + b"\xde\xad\xbe\xef" + bytes(range(0, 32))
+    hits = search_bytes(binary, as_patterns("deadbeef", "hex"))
+    check("binary context falls back to hex",
+          len(hits) == 1 and all(c in "0123456789abcdef" for c in hits[0][2]),
+          hits[0][2] if hits else "-")
+
+
+def _raises(fn):
+    try:
+        fn()
+        return False
+    except Exception:
+        return True
+
+
+def test_report():
+    print("\nHTML report")
+    d = os.path.join(tempfile.gettempdir(), "pcmx_rep")
+    os.makedirs(d, exist_ok=True)
+    src = os.path.join(d, "tiny.img")
+    make_mmi_image(src)
+    out = os.path.join(d, "out.html")
+    try:
+        build_report(src, out)
+        html = open(out, encoding="utf-8").read()
+        check("report is written", os.path.exists(out))
+        check("self-contained (no external refs)",
+              "http://" not in html and "https://" not in html)
+        check("names the image", "tiny.img" in html)
+        check("has the partition table", "<table>" in html and "part" in html)
+        check("carries the privacy warning", "VIN" in html)
+        check("states it is read-only", "read-only" in html)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_version():
     print("\nversion reporting")
     import pcmexplorer
@@ -546,6 +605,8 @@ def main():
     test_hbm5()
     test_hbm5_geom()
     test_images()
+    test_search()
+    test_report()
     test_version()
     test_real_image_if_present()
     print("\n%s" % ("ALL PASSED" if not _fails

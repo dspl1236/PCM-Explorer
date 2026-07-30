@@ -108,15 +108,22 @@ class Explorer(tk.Tk):
         cv.create_rectangle(0, 0, DISPLAY_W, DISPLAY_H, outline=ACCENT)
         # biggest first, so small elements land on top of their containers
         drawn = 0
-        for _rid, b, lab in sorted(boxes, key=lambda r: -(r[1][2] * r[1][3])):
+        for rid, b, lab in sorted(boxes, key=lambda r: -(r[1][2] * r[1][3])):
             x, y, w, h, src = b
             if w <= 0 or h <= 0 or x > DISPLAY_W or y > DISPLAY_H:
                 continue
             colour = ACCENT if "P" in src else DIM
             cv.create_rectangle(x, y, x + w, y + h, outline=colour)
-            if lab and w > 26 and h > 12:
-                cv.create_text(x + 3, y + 2, anchor="nw", text=lab[:24],
-                               fill=TEXT, font=("Consolas", 7))
+            if lab and w > 20 and h > 10:
+                # draw the label at the element's own font size, centred like the
+                # unit would -- the metrics are in the file, so use them rather
+                # than one fixed size that makes every screen look the same
+                px = sc.font_px(rid) or 11
+                px = max(6, min(px, h - 2))
+                cv.create_text(x + w // 2, y + h // 2, anchor="center",
+                               text=lab[:40], fill=TEXT,
+                               font=("Segoe UI", -px),
+                               width=max(10, w - 4))
             drawn += 1
         ttk.Label(win, style="Dim.TLabel",
                   text="%d of %d elements drawn   %dx%d   gold = position "

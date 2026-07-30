@@ -129,6 +129,65 @@ def open_side(path, part=None):
                          "partition")
 
 
+def find_baseline(disc_path, want="persistence", against=None):
+    """Locate the factory baseline for a comparison inside an update disc.
+
+    "What is non-stock on this unit" is the question people actually have, and
+    answering it by hand means knowing that the factory ``/HBpersistence`` lives
+    in a ``.efs`` at ``ADR3000000`` inside whichever release matches the car.
+    That is three steps of tribal knowledge before the comparison even starts,
+    so this does the finding.
+
+    Returns (label, side) or (None, None).
+    """
+    disc = UpdateDisc(disc_path)
+    files = disc.files()
+    if want == "persistence":
+        # A disc carries one baseline per release -- ARB, CHN, RDW, several
+        # versions. Taking the first is a coin toss dressed as an answer, so
+        # score each against the unit and use the best fit.
+        import tempfile
+        cands = [p for p in files
+                 if p.lower().endswith(".efs") and "hbpersistence" in p.lower()]
+        best, best_side, best_score = None, None, -1
+        for i, p in enumerate(cands):
+            data = disc.read(p)
+            if not data:
+                continue
+            tmp = os.path.join(tempfile.gettempdir(), "pcmx_baseline_%d.efs" % i)
+            with open(tmp, "wb") as f:
+                f.write(data)
+            try:
+                side = _from_entries(p.rsplit("/", 1)[-1], EfsImage(tmp),
+                                     "EFS", flat=True)
+            except Exception:
+                continue
+            if against is None:
+                return p, side                     # nothing to score against
+            _a, _r, _c, same, _bn = compare(side, against)
+            if same > best_score:
+                best, best_side, best_score = p, side, same
+        if best_side is not None:
+            label = best
+            if len(cands) > 1:
+                label = "%s  (best of %d, %d files identical)" % (
+                    best, len(cands), best_score)
+            return label, best_side
+        # fall back to the update's own overlay, which is a subset
+        overlay = [p for p in files if "/FIL/HBpersistence/" in p]
+        if overlay:
+            index, store = {}, {}
+            for p in overlay:
+                data = disc.read(p) or b""
+                key = "/" + p.split("/FIL/HBpersistence/", 1)[1]
+                index[key] = (len(data), _sha(data))
+                store[key] = p
+            return ("FIL/HBpersistence overlay",
+                    Side("update overlay", index,
+                         lambda k: disc.read(store[k]) or b"", kind="disc overlay"))
+    return None, None
+
+
 def compare(a, b):
     """Return (added, removed, changed, same, by_name).
 
