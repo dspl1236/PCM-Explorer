@@ -22,6 +22,10 @@ from pcmexplorer.hbm5geom import (ANCHOR_KINDS, DISPLAY_H, DISPLAY_W,
                                   _varint as _gvarint)
 from pcmexplorer.images import (bmp_to_ppm, describe, identify,
                                 raw_candidates, rgb565_to_ppm)
+from pcmexplorer.timeline import (bulk_stamp as tl_bulk, clusters as tl_clusters,
+                                  collect as tl_collect, format_timeline as tl_format,
+                                  implausible as tl_implausible)
+from pcmexplorer.hbm5geom import Screens
 from pcmexplorer.search import as_patterns, search_bytes
 from pcmexplorer.report import build as build_report
 from pcmexplorer.diffimg import compare, format_report, open_side
@@ -563,6 +567,84 @@ def test_report():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_timeline():
+    print("\ntimeline")
+    REG = 0o100644
+    def ent(mtime, size):
+        return {"mode": REG, "mtime": mtime, "size": size}
+    build = 1400000000
+    walk = [("/a", ent(build, 10)), ("/b", ent(build, 20)),
+            ("/c", ent(build, 30)), ("/d", ent(build, 40)),
+            ("/recent", ent(build + 999999, 50)),
+            ("/broken", ent(1, 60)),
+            ("/dir", {"mode": 0o040755, "mtime": build, "size": 0})]
+    rows = tl_collect(walk)
+    check("directories are skipped", len(rows) == 6, "got %d" % len(rows))
+    check("newest first", rows[0][1] == "/recent", rows[0][1])
+    mt, n = tl_bulk(rows)
+    check("the shared build timestamp is found", mt == build and n == 4,
+          "%s x%s" % (mt, n))
+    check("an unset clock is flagged",
+          [r[1] for r in tl_implausible(rows)] == ["/broken"],
+          str(tl_implausible(rows)))
+    # two writes an hour apart are separate sessions; adjacent ones are not
+    close = tl_collect([("/x", ent(build, 1)), ("/y", ent(build + 5, 1)),
+                        ("/z", ent(build + 90000, 1))])
+    cs = tl_clusters(close)
+    check("writes group into sessions", len(cs) == 2, "got %d" % len(cs))
+    check("a session keeps its members",
+          sorted(len(c["files"]) for c in cs) == [1, 2],
+          str([len(c["files"]) for c in cs]))
+    out = tl_format(rows)
+    check("report mentions the build cluster", "written together" in out)
+    check("report warns about the clock", "clock was not set" in out)
+
+
+def test_svg():
+    print("\nSVG export")
+    # a text element stores height 0 -- its height comes from the font, and a
+    # renderer that filters on height silently drops every label on the screen
+    class FakeScreens(object):
+        DISPLAY = (800, 480)
+        def __init__(self):
+            # 2 is a text element: real width, zero height, font supplies it.
+            # 3 is a normal box whose position came from a resolved reference.
+            self.boxes = {1: (0, 0, 800, 480, ""), 2: (10, 20, 200, 0, ""),
+                          3: (12, 78, 74, 65, "PS")}
+            self.labels = {2: "Stationstasten", 3: "wxyz"}
+            self.fonts = {2: 29, 3: 24}
+        def subtree(self, r):
+            return {1, 2, 3}
+        def children(self, rid):
+            return [2, 3] if rid == 1 else []
+        def box(self, rid, anchor=0):
+            return self.boxes.get(rid)
+        def label(self, rid):
+            return self.labels.get(rid)
+        def font_px(self, rid):
+            return self.fonts.get(rid)
+    svg = Screens.to_svg(FakeScreens(), 1)
+    check("is well-formed XML", _parses_xml(svg))
+    check("viewBox is the display", 'viewBox="0 0 800 480"' in svg, svg[:120])
+    check("a zero-height text element still draws its label",
+          "Stationstasten" in svg, "label missing")
+    check("label uses the element's own font size", 'font-size="29"' in svg,
+          "font size not applied")
+    check("a resolved-by-reference box is marked", "#c8a44e" in svg)
+    # background + the two elements that have a height; the text one has none
+    check("no rect is emitted for a zero-height element",
+          svg.count("<rect") == 3, "rects=%d" % svg.count("<rect"))
+
+
+def _parses_xml(s):
+    import xml.etree.ElementTree as ET
+    try:
+        ET.fromstring(s)
+        return True
+    except Exception:
+        return False
+
+
 def test_version():
     print("\nversion reporting")
     import pcmexplorer
@@ -607,6 +689,8 @@ def main():
     test_images()
     test_search()
     test_report()
+    test_timeline()
+    test_svg()
     test_version()
     test_real_image_if_present()
     print("\n%s" % ("ALL PASSED" if not _fails

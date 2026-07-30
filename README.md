@@ -32,6 +32,9 @@ python explorer.py moccaV2Target.mmi                  # the HMI itself
 python explorer.py moccaV2Target.mmi langs            # every string, every language
 python explorer.py moccaV2Target.mmi screens 33616    # a screen's elements, x/y/w/h
 
+python explorer.py timeline disk.img P2               # what changed, and when
+python explorer.py moccaV2Target.mmi svg 33616        # a screen as SVG
+
 python explorer.py grep disk.img Burmester P2         # which file mentions this?
 python explorer.py grep PCM3_IFS2.ifs --hex 48424d35  # or a byte pattern (HBM5)
 
@@ -66,6 +69,12 @@ python explorer.py report disk.img unit.html          # one page you can send
 - **Answers "what on this unit is not factory"** in one step. The baseline lives in a
   `.efs` inside whichever release matches the car — `stock` finds it, and since a disc
   carries fourteen candidates it scores each against the unit rather than guessing.
+- **Shows what changed and when.** `timeline` sorts by mtime and groups files into the
+  writing sessions they belonged to, flagging the build cluster everything shares and
+  the files written while the clock was unset -- a head unit with no GPS fix boots
+  believing it is 2097.
+- **Exports a screen as SVG**, so a custom app can be laid out on real OEM metrics
+  instead of guessed ones -- open it in Inkscape and draw against it.
 - **Writes one shareable HTML page** about an image: what it is, whether each partition
   read cleanly, what is non-stock, and the bootscreens inlined. Self-contained, so it
   attaches to a forum post and still works.

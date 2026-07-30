@@ -432,6 +432,20 @@ class Screens(object):
                 break
         return uniq
 
+    def text_height(self, rid, box=None):
+        """Height to draw a text element at.
+
+        Text records store a width -- the wrap width -- and a height of zero,
+        because the real height comes from the font and is resolved when the
+        unit lays the screen out. Every labelled element in a screen therefore
+        has ``h == 0``, and a renderer that filters on height draws no text at
+        all. Substituting the font height is what the unit effectively does.
+        """
+        b = box or self.box(rid)
+        if b and b[3] > 0:
+            return b[3]
+        return self.font_px(rid) or 0
+
     def font_px(self, rid):
         """Pixel height of the font an element draws in, or None.
 
@@ -507,6 +521,64 @@ class Screens(object):
                     return t
             queue.extend(self.children(cur))
         return None
+
+    def to_svg(self, root, anchor=0, labels=True):
+        """One screen as SVG -- openable in a browser or a vector editor.
+
+        The point is not the picture. It is that a custom app can be laid out
+        on top of the real OEM metrics instead of guessed ones: drop this into
+        Inkscape, draw against it, and list rows land at 664x69 and buttons at
+        66x57 because that is what the unit actually uses.
+
+        Boxes whose position came from a resolved reference are marked, so it
+        is visible which numbers were read and which were defaulted.
+        """
+        import xml.sax.saxutils as sx
+
+        seen, stack, items = set(), [root], []
+        while stack and len(seen) < 20000:
+            rid = stack.pop()
+            if rid in seen:
+                continue
+            seen.add(rid)
+            b = self.box(rid, anchor)
+            if b:
+                items.append((rid, b, self.label(rid), self.font_px(rid)))
+            stack.extend(self.children(rid))
+        # biggest first so children paint over their containers
+        items.sort(key=lambda t: -(t[1][2] * t[1][3]))
+
+        out = ['<?xml version="1.0" encoding="UTF-8"?>',
+               '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
+               'viewBox="0 0 %d %d">' % (DISPLAY_W, DISPLAY_H,
+                                         DISPLAY_W, DISPLAY_H),
+               '<desc>PCM 3.1 screen %d, %d elements. Geometry is decoded; '
+               'bitmaps are not in the .mmi files and are not drawn.</desc>'
+               % (root, len(items)),
+               '<rect width="%d" height="%d" fill="#101014"/>'
+               % (DISPLAY_W, DISPLAY_H)]
+        for rid, (x, y, w, h, src), lab, px in items:
+            if w <= 0:
+                continue
+            # a text element stores h == 0; its height is the font's
+            hh = h if h > 0 else (px or 0)
+            if hh <= 0:
+                continue
+            stroke = "#c8a44e" if "P" in src else "#4a4a58"
+            out.append('<g id="e%d">' % rid)
+            if h > 0:
+                out.append('<rect x="%d" y="%d" width="%d" height="%d" fill="none" '
+                           'stroke="%s" stroke-width="1"/>' % (x, y, w, h, stroke))
+            if labels and lab and w > 12:
+                size = max(6, min(px or 14, hh))
+                out.append('<text x="%d" y="%d" fill="#e8e8ed" font-size="%d" '
+                           'font-family="Segoe UI, DejaVu Sans, sans-serif" '
+                           'text-anchor="middle" dominant-baseline="middle">%s</text>'
+                           % (x + w // 2, y + hh // 2, size,
+                              sx.escape(lab[:48])))
+            out.append('</g>')
+        out.append('</svg>')
+        return "\n".join(out)
 
     def stats(self):
         """How well resolution is doing -- the number to watch after a change."""

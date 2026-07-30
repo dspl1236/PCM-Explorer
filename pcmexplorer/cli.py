@@ -47,12 +47,17 @@ HMI definitions (.mmi) hold the screens and every string the unit can display:
   pcm-explorer <x.mmi> langs [pattern]      keys resolved across all languages
   pcm-explorer <x.mmi> verify               container self-check
   pcm-explorer <x.mmi> screens [root]       drawables resolved to x/y/w/h
+  pcm-explorer <x.mmi> svg <root> [out]     a screen as SVG, to design against
 
 Search contents across any of the above:
 
   pcm-explorer grep <target> <pattern> [part]   which files contain this?
   pcm-explorer grep disk.img Burmester P2
   pcm-explorer grep PCM3_IFS1.ifs --hex 89504e47
+
+What changed on this unit, and when:
+
+  pcm-explorer timeline disk.img [part]     files by mtime, as writing sessions
 
 One shareable HTML page about an image:
 
@@ -429,6 +434,24 @@ def _hbm5_cmd(m, cmd, a):
             print("\n%d translated key%s" % (shown, "" if shown == 1 else "s"))
         return 0
 
+    if cmd == "svg":
+        from .hbm5geom import Screens
+        if not a:
+            print("usage: svg <root-id> [out.svg]")
+            return 1
+        sc = Screens(m)
+        try:
+            root = int(a[0], 0)
+        except ValueError:
+            print("usage: svg <root-id> [out.svg]")
+            return 1
+        out = a[1] if len(a) > 1 else "screen_%d.svg" % root
+        svg = sc.to_svg(root)
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(svg)
+        print("wrote %s (%s)" % (out, human(len(svg.encode("utf-8")))))
+        return 0
+
     if cmd in ("screens", "boxes"):
         from .hbm5geom import Screens
         sc = Screens(m)
@@ -519,6 +542,47 @@ def cmd_grep(argv):
     print("\n%d hit%s in %d file%s"
           % (nh, "" if nh == 1 else "s", nf, "" if nf == 1 else "s"))
     return 0 if nf else 1
+
+
+def cmd_timeline(argv):
+    """What changed on this unit, and when."""
+    from .timeline import collect, format_timeline
+    if not argv:
+        print("usage: timeline <image> [part] [--flat]")
+        print("  Files by modification time, newest first, grouped into the")
+        print("  writing sessions they were part of.")
+        return 1
+    src = argv[0]
+    flat = "--flat" in argv
+    part = next((a for a in argv[1:] if re.match(r"^[PL]\d+$", a)), None)
+
+    walkers = []
+    if looks_like_efs(src):
+        walkers.append(("EFS", EfsImage(src).entries()))
+    elif looks_like_ifs(src):
+        walkers.append(("firmware", FirmwareImage(src).entries()))
+    else:
+        try:
+            img = DiskImage(src)
+        except Exception as e:
+            print("could not open %s: %s" % (src, e))
+            return 1
+        if not img.parts:
+            print("no partitions in %s" % src)
+            return 1
+        for p in img.parts:
+            if part and p["name"] != part:
+                continue
+            fs = img.open_fs(p)
+            if fs:
+                walkers.append((p["name"], fs.walk()))
+    if not walkers:
+        print("nothing readable to build a timeline from")
+        return 1
+    for label, walker in walkers:
+        print("\n=== %s ===" % label)
+        print(format_timeline(collect(walker), group=not flat))
+    return 0
 
 
 def cmd_report(argv):
@@ -644,6 +708,8 @@ def main(argv):
         return cmd_stock(argv[1:])
     if argv[0] == "report":
         return cmd_report(argv[1:])
+    if argv[0] == "timeline":
+        return cmd_timeline(argv[1:])
 
     path = argv[0]
     # a directory is only meaningful as an extracted update-disc tree
