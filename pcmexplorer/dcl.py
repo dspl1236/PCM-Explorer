@@ -677,8 +677,31 @@ def _table_length(body):
     return sum(vals[1::2]) or None
 
 
-def response_length(d, key, keylen=2):
+#: Lengths measured on a live PCM 3.1 that the config provably cannot supply.
+#: These are **measurements, not derivations**, and are kept separate from
+#: :func:`response_length` for that reason -- folding a measured constant into
+#: the derived rule is how a fitted parameter gets back in, and two agents
+#: proposed exactly that to claim 17/17 on this one identifier.
+#:
+#: ``21 1B`` is a type-18 (VECTOR8) buffer on signal 20193. Searched and found
+#: absent: the config never slices that signal, so no width is implied there;
+#: ``PCM3Reload`` holds no signal-size table (its 65 raw hits for 20193 show no
+#: consistent nearby size, and the id search is noise-dominated at that scale);
+#: and neither ifs1 nor ifs2 carries an IO-subsystem declaration file. The
+#: length is supplied by the IO subsystem at run time.
+#:
+#: Worth noting: this one's value was byte-identical across two bench runs
+#: (``20 32 1a 25 5a 69``) where ``21 12`` and ``21 FE`` both changed, so it is
+#: a static identifier rather than live data.
+MEASURED_LENGTH = {0x211B: 6}
+
+
+def response_length(d, key, keylen=2, measured=False):
     """Predicted byte length of the answer to a KWP request, or None.
+
+    Pass ``measured=True`` to fall back to :data:`MEASURED_LENGTH` for requests
+    whose length the file cannot carry. The default is derivation only, so a
+    caller cannot mistake a bench reading for something the config said.
 
     The response producers are the sources of every code-6/code-7 row aimed at
     the service's entry node on **port 1** -- a destination port is a function
@@ -708,7 +731,7 @@ def response_length(d, key, keylen=2):
                     widths.append(w)
         if widths:
             return max(set(widths), key=widths.count)
-    return None
+    return MEASURED_LENGTH.get(key) if measured else None
 
 
 def expression_operands(d):
