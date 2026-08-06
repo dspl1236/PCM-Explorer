@@ -65,9 +65,18 @@ srcport, dst, dstport, seq ; u32 const ; u8 isconst ; u8 opindex``.  ``isconst``
 says whether the value is the literal in ``const`` or arrives over the dataflow
 graph from ``src:srcport``.
 
-They group **positionally**, by the attribute that owns them -- see
-:func:`operands`.  There is no pointer from a ``0x23`` record to its operand
-group; matching is on arity.
+**Binding is by node number, not by arity** -- see :func:`expression_operands`.
+Every attribute is a node of a dataflow graph, and node numbers are local to the
+graph that references them.  For a graph at attribute index ``gi`` with largest
+referenced node ``nmax``, ``S = gi - nmax - 1`` maps node to attribute.  An
+expression's operands are then the code-6 and code-7 records aimed at its node
+on port 0, replayed in file order through the firmware's registrar.
+
+That is why arity matching never worked: an expression and its operands are
+always in *different* attributes, so there was nothing within one attribute to
+match.  :func:`operands` and :func:`operand_groups` predate this and group at
+the attribute level, which unions unrelated lists; the real unit is the
+``(graph, dst, dstport)`` triple.
 
 **The calculate nodes form a dataflow graph, and most expressions cannot be
 evaluated standalone.**  Both nine-member operand groups in gen400 have
@@ -95,11 +104,22 @@ more (``"xa'"`` twice and ``"xA'"`` in gen400) that the oracle's character
 heuristic misses.  A superset, not an identical set: the walk is the more
 correct of the two.
 
-What is **not** established: what any expression computes.  100% coverage
-proves record *boundaries*, not field *interpretation* -- 85.5% of the stream
-is payload the walk never inspects.  In particular there is no support here for
-any claim about the nine-placeholder expression, and no evidence either way on
-whether the KWP SecurityAccess seed/key derivation lives in this file.
+Expressions now bind to their operands and can be computed.  All 52 bind, 49
+with one slot per placeholder, and the nine-placeholder expression resolves to
+a byte-order conversion: one dynamic source repeated three times against masks
+``0xFF0000/0xFF00/0xFF`` and shifts ``16/8/8``, giving ``0x123456 -> 0x345612``.
+That it lands on a recognisable idiom, rather than plausible-looking numbers, is
+the strongest evidence the binding is right -- a misaligned map yields garbage.
+
+The honest boundary is the node map itself, which is **fitted**.  It is heavily
+constrained -- it tiles all 2900 attributes exactly once, its 237 independently
+computed ``S`` values collapse to 7, and a one-attribute misalignment drops
+binding from 52 to 19 -- but the firmware establishes only that node numbers are
+dense indices into a pointer vector, and the obvious derivation of that vector
+does not reproduce the map.  See :func:`node_map`.
+
+Still not established: whether the KWP SecurityAccess seed/key derivation lives
+in this file.  No evidence either way.
 
 ``scan_expressions()`` stays independent of the record model on purpose: it is
 the oracle the walk is scored against.  Coverage alone is not evidence and must
@@ -293,6 +313,139 @@ def operands(d):
             rows.append((vo, src, sport, dst, dport, seq, const, b[14], b[15]))
         if rows:
             out[o] = rows
+    return out
+
+
+def graphs(d):
+    """``attr_index -> {rows, base, nmax, S}`` for every dataflow graph.
+
+    A graph attribute is one holding code-6 or code-7 records. Node numbers are
+    **local to the graph**, and the whole binding problem turns on converting
+    them to attribute indices; see :func:`node_map`.
+    """
+    out = {}
+    for gi, (o, path, vals) in enumerate(attributes(d)):
+        rows = []
+        for vo, c, b in vals:
+            if c not in (6, 7):
+                continue
+            src, sport, dst, dport, seq = struct.unpack_from("<5H", b, 0)
+            if c == 6:
+                rows.append((6, vo, src, sport, dst, dport, seq, 0, 0, 0, 0))
+            else:
+                rows.append((7, vo, src, sport, dst, dport, seq,
+                             struct.unpack_from("<I", b, 10)[0],  # const
+                             b[14],                               # isconst
+                             struct.unpack_from("<I", b, 15)[0],  # opindex
+                             b[19]))                              # hasindex
+        if not rows:
+            continue
+        ns = {r[2] for r in rows} | {r[4] for r in rows}
+        out[gi] = {"rows": rows, "offset": o, "base": min(ns), "nmax": max(ns),
+                   "S": gi - max(ns) - 1}
+    return out
+
+
+def node_map(d):
+    """``(attr2node, node2attr)`` -- node numbers <-> attribute indices.
+
+    For a graph at attribute index ``gi`` with largest referenced node
+    ``nmax``, ``S = gi - nmax - 1`` and ``attr(n) = gi if n == base else n + S``.
+
+    **This map is fitted, and that is the rule's honest boundary.** It is very
+    heavily constrained -- it tiles all 2900 attributes exactly once with no
+    duplicates or gaps, the 237 independently computed ``S`` values collapse to
+    just 7, and misaligning it by a single attribute collapses expression
+    binding from 52 to 19 -- but the firmware establishes only that node numbers
+    are dense indices into a pointer vector, and the first-principles derivation
+    of that vector does *not* reproduce this map. Something reorders it that has
+    not been located. Treat the map as a well-tested premise, not as read.
+
+    Dropping the ``-1`` is the trap: that variant still satisfies
+    ``base == min(node)`` on 237/237 graphs and still yields exactly 7 ``S``
+    values, so every endpoint check passes while interior binding collapses.
+    """
+    attr2node, node2attr = {}, {}
+    for gi, g in graphs(d).items():
+        for n in range(g["base"], g["nmax"] + 1):
+            a = gi if n == g["base"] else n + g["S"]
+            node2attr[(gi, n)] = a
+            attr2node[a] = (gi, n)
+    return attr2node, node2attr
+
+
+def operand_slots(d, gi, nd, _graphs=None):
+    """The operand array for node `nd` of graph `gi`, indexed by slot.
+
+    Replays the firmware's input registrar. Code-6 **and** code-7 records reach
+    it through the same path (``089053D8`` -> ``08910C90`` -> ``089113B0`` ->
+    ``vtbl[7]`` = ``08906FB8``), which is why considering only code 7 leaves an
+    expression unbound: two code-6 edges register its operands instead.
+
+        dport not in (0, 1)  discarded by the registrar outright
+        dport == 1           event input, never an operand
+        dport == 0           slot = opindex when a code-7 row carries an index
+                             object (body byte 19), else the next free slot;
+                             grow the flag vector to slot+1; count = seq+1
+
+    The operand count is ``len(...)`` -- ``max(slot)+1`` -- **not** the row
+    count and not the number of distinct opindex values. Rows sharing a slot are
+    last-write-wins alternatives (``Collect`` at ``08906CBC`` destroys the
+    previous occupant), so they are one placeholder, not several.
+
+    Returns a list indexed **by slot**; unwritten slots are ``None``. Do not
+    compact it: ranking the slots densely agrees almost everywhere and silently
+    shifts the one expression whose slot 0 is never written.
+    """
+    g = (_graphs or graphs(d))[gi]
+    flags, count = [], 0
+    for r in sorted(g["rows"], key=lambda r: r[1]):        # file order
+        code, vo, src, sport, dst, dport, seq, const, isconst, opix, hasidx = r
+        if dst != nd or dport != 0:
+            continue
+        if seq < count:                                    # cmp/ge at 08906FD8
+            continue
+        slot = opix if (code == 7 and hasidx) else len(flags)
+        while len(flags) <= slot:
+            flags.append(None)
+        flags[slot] = (("const", const) if (code == 7 and isconst)
+                       else ("dyn", src, sport))
+        count = seq + 1
+    return flags
+
+
+def expression_operands(d):
+    """``[(attr_index, offset, text, slots), ...]`` -- every expression, bound.
+
+    This supersedes matching on arity, which could not work: the expression and
+    its operands live in different attributes, so there was nothing to match
+    within one. The link is the node map, and it binds all 52 expressions in the
+    shipped file, 49 of them with one slot per placeholder.
+
+    The three that differ are diagnosed rather than absorbed:
+
+    * ``xA'`` -- one placeholder, two slots. Not a binding failure: the ``A``
+      handler drains the whole operand array rather than taking one element per
+      placeholder, so its arity *is* the array length.
+    * ``xDx=`` -- two placeholders, one slot. A genuine deficit; with one
+      operand the ``=`` would underflow, which suggests dead config, though that
+      is not established.
+    * ``xDx>xx<`` -- four placeholders, three slots, and slot 0 never written.
+      The only port-0 group in the file whose slots are not dense from zero.
+    """
+    gs = graphs(d)
+    attr2node, _ = node_map(d)
+    out = []
+    for j, (o, path, vals) in enumerate(attributes(d)):
+        for vo, c, b in vals:
+            if c != 0x23:
+                continue
+            text = _string_value(b).decode("latin1")
+            if not text:
+                continue
+            gi_nd = attr2node.get(j)
+            slots = operand_slots(d, *gi_nd, _graphs=gs) if gi_nd else []
+            out.append((j, vo, text, slots))
     return out
 
 
