@@ -549,99 +549,155 @@ def _sx(v):
     return v - 0x100000000 if v & 0x80000000 else v
 
 
-def evaluate(expr, ops, memory=0):
-    """Evaluate an RPN expression string with `ops` filling its ``x`` slots.
+#: Characters the interpreter's dispatch tree recognises, with the handler each
+#: reaches. Recovered by *interpreting* the tree at 0x089062DC per character
+#: with delay-slot semantics honoured -- it is compiler-generated binary search
+#: that reuses branch delay slots to hold the next comparison, so pairing
+#: comparisons with the following branch textually attributes them to the wrong
+#: character. Anything absent falls to the reject arm at 0x08906C1A.
+RPN_HANDLERS = {
+    "x": 0x0890640E, "+": 0x08906442, "*": 0x08906458, "-": 0x08906474,
+    "/": 0x0890648A, "&": 0x089064E8, "|": 0x08906550, "%": 0x089065B8,
+    "=": 0x089065DE, ">": 0x08906616, "<": 0x089066BC, "?": 0x0890676E,
+    "^": 0x08906790, "!": 0x089067B6, "~": 0x089067C8, "i": 0x08906828,
+    "o": 0x089068E0, "r": 0x0890692E, "D": 0x089069EA, "d": 0x08906A00,
+    "a": 0x08906A16, "A": 0x08906A38, "m": 0x08906B20, "M": 0x08906B54,
+}
 
-    The token table came out of the SH4 dispatch tree in PCM3Reload at
-    0x089062DC-0x08906402, emulated over all 128 character values because the
-    tree is a `cmp/hi`/`cmp/hs` binary search whose arms cannot all be found by
-    pattern matching -- several, including ``=``, are reached by range
-    exclusion and never get a `cmp/eq` of their own.
+#: Tokens whose behaviour has been read out of the handler machine code. Every
+#: other recognised character is deliberately unimplemented -- see `evaluate`.
+RPN_VERIFIED = frozenset("+-*^~&|x")
 
-    Characters outside the table are silently skipped: the switch default at
-    0x08906C1A only increments the index.  That is what happens to the ``'`` in
-    the one nine-operand expression, so it contributes nothing.
 
-    Confirmed against real operand vectors: node 187 is ``(v >> 4) + 0x30`` and
-    node 188 is ``(v & 0x0F) + 0x30``, the two halves of a byte-to-ASCII
-    conversion, and node 904 is the six-term weighted sum.  The comparison,
-    memory and denial tokens are read off the interpreter's own debug format
-    strings and are not exercised by any operand vector, so treat those as
-    less certain than the arithmetic ones.
+def evaluate(expr, ops, strict=True):
+    """Evaluate an RPN template, using only semantics verified from the firmware.
+
+    The template interpreter in `PCM3Reload` is a **stack machine**, not a
+    compiler: each character's handler does its arithmetic inline, with `@r9`
+    the top of stack, `@(4,r9)` the next entry and `r12` the depth. It is a
+    separate mechanism from `CRBDiagCalculate::calculate` and its 22 opcodes,
+    which serve the dataflow-graph nodes. Do not mix the two.
+
+    **Subtraction is reversed from conventional RPN.** The `-` handler is::
+
+        mov.l @r9,r1       ; TOS
+        mov.l @(4,r9),r2   ; NEXT
+        sub   r2,r1        ; TOS - NEXT
+
+    so `a b -` yields `b - a`, not `a - b`. That is presumably why the opcode
+    set carries both `Sub` and `SubRev`. Getting this backwards produces
+    plausible numbers that are quietly wrong, which is the whole reason this
+    function was rewritten.
+
+    Implemented, each read from its handler:
+
+    ==========  ==========================  ============================
+    token       handler                     operation
+    ==========  ==========================  ============================
+    ``x``       ``0890640E``                push the next operand
+    ``+``       ``08906442``                ``add r2,r1``   TOS + NEXT
+    ``-``       ``08906474``                ``sub r2,r1``   TOS - NEXT
+    ``*``       ``08906458``                ``mul.l``       TOS * NEXT
+    ``^``       ``08906790``                ``xor r2,r1``
+    ``~``       ``089067C8``                ``not r1,r1``
+    ``&``       ``089064E8``                bitwise and
+    ``|``       ``08906550``                bitwise or
+    ==========  ==========================  ============================
+
+    Everything else raises. `/` and `%` call helper routines whose operand
+    order has not been established; the comparison, memory, denial, rounding
+    and averaging tokens have handlers but their stack effects were not read.
+    A previous version guessed at all of these and claimed confirmation against
+    "node 187", which turned out to be an artifact of a keying bug in
+    :func:`operands` -- the expression at that ident is not what was assumed.
+    Refusing is better than returning a number nobody can trust.
+
+    Pass ``strict=False`` to skip unknown tokens instead of raising, which
+    matches the interpreter's own reject arm but will silently change the
+    result. Only useful for surveying which expressions are evaluable at all.
+
+    Digraphs (``&&``, ``||``, ``>=``, ``>>``, ``<<``, ``<=``, ``MR`` ...) are
+    handled by the *first* character's handler peeking the next one, confirmed
+    by `cmp/eq` against the following character inside each handler. They are
+    recognised here so they are not mis-split, then refused.
     """
     st, i, k, n = [], 0, 0, len(expr)
     while i < n:
-        t = expr[i:i + 2]
-        if t in RPN_DIGRAPHS:
+        tok = expr[i:i + 2]
+        if tok in RPN_DIGRAPHS:
             i += 2
         else:
-            t = expr[i]
+            tok = expr[i]
             i += 1
-        if t == "x":
+
+        if tok == "x":
             if k >= len(ops):
                 raise ValueError("expression %r wants operand %d of %d"
                                  % (expr, k, len(ops)))
             st.append(_sx(ops[k]))
             k += 1
-        elif t in ("D", "d"):
-            pass                                  # denial flag, no stack effect
-        elif t in ("MR", "m"):
-            st.append(_sx(memory))
-        elif t == "M":
-            memory = st[-1] if st else 0
-        elif t in ("M+", "m+"):
-            memory = _sx(memory + (st.pop() if st else 0))
-        elif t == "a":
-            st.append(abs(st.pop()))
-        elif t == "A":
-            vals = st[:]
-            st[:] = [sum(vals) // len(vals)] if vals else [0]
-        elif t == "!":
-            st.append(int(not st.pop()))
-        elif t == "~":
+            continue
+        if tok in ("+", "-", "*", "^", "&", "|"):
+            if len(st) < 2:
+                raise ValueError("stack underflow at %r in %r" % (tok, expr))
+            tos, nxt = st.pop(), st.pop()
+            if tok == "+":
+                st.append(_sx(tos + nxt))
+            elif tok == "-":
+                st.append(_sx(tos - nxt))       # TOS - NEXT, see docstring
+            elif tok == "*":
+                st.append(_sx(tos * nxt))
+            elif tok == "^":
+                st.append(_sx(tos ^ nxt))
+            elif tok == "&":
+                st.append(_sx(tos & nxt))
+            else:
+                st.append(_sx(tos | nxt))
+            continue
+        if tok == "~":
+            if not st:
+                raise ValueError("stack underflow at '~' in %r" % expr)
             st.append(_sx(~st.pop()))
-        elif t == "?":
-            c, b, a = st.pop(), st.pop(), st.pop()
-            st.append(b if a else c)
-        elif t in ("i", "o"):
-            hi, lo, v = st.pop(), st.pop(), st.pop()
-            inside = int(lo <= v <= hi)
-            st.append(inside if t == "i" else 1 - inside)
-        elif t in ("r<", "r>"):
-            hi, lo, _v = st.pop(), st.pop(), st.pop()
-            st.append(lo if t == "r<" else hi)
-        elif t in _BINARY:
-            b, a = st.pop(), st.pop()
-            st.append(_sx(_BINARY[t](a, b)))
-        # anything else falls through the switch default: index++, no effect
-    return st[-1] if st else 0
+            continue
+
+        if strict:
+            known = tok in RPN_HANDLERS or tok in RPN_DIGRAPHS
+            raise NotImplementedError(
+                "token %r in %r is %s; its stack effect has not been read from "
+                "the firmware, so evaluating would be a guess"
+                % (tok, expr,
+                   "recognised by the interpreter (handler %s)"
+                   % ("0x%08X" % RPN_HANDLERS[tok] if tok in RPN_HANDLERS
+                      else "digraph") if known else "not recognised"))
+    if not st:
+        raise ValueError("expression %r produced no value" % expr)
+    return st[-1]
 
 
-def _idiv(a, b):
-    return 0 if b == 0 else int(a / b)            # C truncation, not floor
+def evaluable(expr):
+    """True when every token in `expr` has verified semantics.
+
+    Use to select which expressions :func:`evaluate` can handle before trying,
+    rather than catching NotImplementedError per expression.
+    """
+    i, n = 0, len(expr)
+    while i < n:
+        tok = expr[i:i + 2]
+        if tok in RPN_DIGRAPHS:
+            return False                        # none are implemented yet
+        tok = expr[i]
+        i += 1
+        if tok not in RPN_VERIFIED:
+            return False
+    return True
 
 
-_BINARY = {
-    "+": lambda a, b: a + b,
-    "-": lambda a, b: a - b,
-    "*": lambda a, b: a * b,
-    "/": _idiv,
-    "%": lambda a, b: 0 if b == 0 else a - _idiv(a, b) * b,
-    "&": lambda a, b: a & b,
-    "|": lambda a, b: a | b,
-    "^": lambda a, b: a ^ b,
-    "<<": lambda a, b: a << (b & 31),
-    ">>": lambda a, b: (a & _MASK32) >> (b & 31),
-    "=": lambda a, b: int(a == b),
-    "<": lambda a, b: int(a < b),
-    ">": lambda a, b: int(a > b),
-    "<=": lambda a, b: int(a <= b),
-    ">=": lambda a, b: int(a >= b),
-    "&&": lambda a, b: int(bool(a) and bool(b)),
-    "||": lambda a, b: int(bool(a) or bool(b)),
-    "i-": lambda a, b: b - a,
-    "i/": lambda a, b: _idiv(b, a),
-}
+# The previous version carried a _BINARY table covering every token -- division,
+# modulo, all six comparisons, the logical pair and the "invers" forms -- with
+# operand orders that were assumed rather than read. It is deleted rather than
+# kept for reference: a plausible table sitting next to a verified one is how
+# the wrong semantics get used by accident. The verified operations live inline
+# in evaluate(), each traceable to a handler address.
 
 
 def bind(vector, value):
