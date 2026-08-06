@@ -93,6 +93,36 @@ def _from_entries(label, obj, kind, flat=False):
                 kind=kind)
 
 
+def _from_fs(label, fs, kind="partition", digest=True):
+    """Adapt a mounted QNX filesystem to a Side.
+
+    ``QNX6FS``/``QNX4FS`` expose ``walk()`` and ``read_file(inode)``, where
+    ``EfsImage`` and ``FirmwareImage`` expose ``entries()`` and ``find()``.
+    :func:`_from_entries` assumes the latter, which is why ``grep`` on a disk
+    image failed with ``'QNX6FS' object has no attribute 'entries'`` -- the
+    searcher was fine, the adapter was missing.
+
+    Sizes come from the inode, so building the index costs no reads. Digests are
+    optional because hashing every file on a 90 GB drive to answer a content
+    search would dominate the runtime, and :func:`search_side` never looks at
+    them -- it only needs the paths and the reader.
+    """
+    index, nodes = {}, {}
+    for pth, ent in fs.walk():
+        if is_dir(ent) or is_link(ent):
+            continue
+        nodes[pth] = ent
+        if digest:
+            try:
+                data = fs.read_file(ent)
+            except Exception:
+                continue
+            index[pth] = (len(data), _sha(data))
+        else:
+            index[pth] = (ent.get("size", 0), None)
+    return Side(label, index, lambda p: fs.read_file(nodes[p]), kind=kind)
+
+
 def _from_disc(path):
     disc = UpdateDisc(path)
     index = {}
@@ -103,8 +133,13 @@ def _from_disc(path):
                 lambda p: disc.read(p) or b"", kind="update disc")
 
 
-def open_side(path, part=None):
-    """Open anything comparable: folder, .ifs, .efs, update disc, or a partition."""
+def open_side(path, part=None, digest=True):
+    """Open anything comparable: folder, .ifs, .efs, update disc, or a partition.
+
+    `digest=False` skips hashing file contents. Comparison needs digests;
+    content search does not, and on a multi-gigabyte drive the difference is
+    minutes against hours.
+    """
     if os.path.isdir(path):
         if looks_like_update_disc(path):
             return _from_disc(path)
@@ -125,8 +160,8 @@ def open_side(path, part=None):
     if fs is None:
         raise ValueError("%s: partition %s has no readable filesystem"
                          % (path, p["name"]))
-    return _from_entries("%s:%s" % (os.path.basename(path), p["name"]), fs,
-                         "partition")
+    return _from_fs("%s:%s" % (os.path.basename(path), p["name"]), fs,
+                    "partition", digest=digest)
 
 
 def find_baseline(disc_path, want="persistence", against=None):

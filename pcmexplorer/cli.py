@@ -526,7 +526,9 @@ def cmd_grep(argv):
     part = next((a for a in args[2:] if re.match(r"^[PL]\d+$", a)), None)
 
     try:
-        side = open_side(target, part)
+        # Search reads every file anyway; hashing them first would double the
+        # work on a 90 GB drive for an index column nothing here reads.
+        side = open_side(target, part, digest=False)
         patterns = as_patterns(pattern, mode, ignore_case)
     except Exception as e:
         print("could not search: %s" % e)
