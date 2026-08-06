@@ -566,7 +566,18 @@ RPN_HANDLERS = {
 
 #: Tokens whose behaviour has been read out of the handler machine code. Every
 #: other recognised character is deliberately unimplemented -- see `evaluate`.
-RPN_VERIFIED = frozenset("+-*^~&|=x")
+RPN_VERIFIED = frozenset("+-*/%^~&|=x")
+
+
+def _trunc_div(a, b):
+    """Integer division truncating toward zero, as C and __sdivsi3_i4 do.
+
+    Python's // floors, which differs from C whenever exactly one operand is
+    negative: -7 // 2 is -4 where C gives -3. The remainder built on top of it
+    inherits the discrepancy, so both operators need this rather than //.
+    """
+    q = abs(a) // abs(b)
+    return -q if (a < 0) != (b < 0) else q
 
 
 def evaluate(expr, ops, strict=True):
@@ -612,13 +623,27 @@ def evaluate(expr, ops, strict=True):
     ``=``       ``089065DE``    ``cmp/eq`` then ``movt`` -- equality, 0 or 1
     ==========  ==============  ==========================================
 
-    Everything else raises. `/` and `%` call helper routines: in `/` the
-    **second** element is the one zero-checked, so it is the divisor and the
-    result looks like ``top / second`` -- reversed relative to subtraction --
-    but that has not been confirmed by reading the helper and is not
-    implemented on the strength of an inference. The comparison, memory,
-    denial, rounding and averaging tokens have handlers whose stack effects
-    were not read.
+    ``/`` and ``%`` both call the imported ``__sdivsi3_i4`` through the PLT stub
+    at ``0804B404`` -- SH4 signed division, ``r4`` dividend, ``r5`` divisor,
+    quotient returned in **FPUL** (that is what the ``_i4`` suffix means, and
+    why capstone shows the following ``sts fpul,r7`` as undecoded bytes)::
+
+        /   r4 = @r9 (second), r5 = @(4,r9) (top)
+            sts fpul,r7 ; mov.l r7,@r9                 second / top
+
+        %   same call, then
+            mul.l r8,r7 ; sts macl,r1 ; sub r1,r6      second - (second/top)*top
+
+    So both are conventional, and ``%`` is C's remainder over a **truncating**
+    division -- the sign follows the dividend, not Python's floor semantics.
+
+    The ``tst r4,r4`` early in ``/`` is a zero-*numerator* shortcut, not a
+    divisor guard: it branches to the epilogue variant that skips the store,
+    leaving ``second`` (which is 0) as the result. Division by zero is not
+    guarded here, so this raises rather than inventing a value.
+
+    The comparison, memory, denial, rounding and averaging tokens have handlers
+    whose stack effects were not read, and still raise.
     A previous version guessed at all of these and claimed confirmation against
     "node 187", which turned out to be an artifact of a keying bug in
     :func:`operands` -- the expression at that ident is not what was assumed.
@@ -668,6 +693,18 @@ def evaluate(expr, ops, strict=True):
                 st.append(_sx(second | top))
             else:
                 st.append(int(second == top))
+            continue
+        if tok in ("/", "%"):
+            if len(st) < 2:
+                raise ValueError("stack underflow at %r in %r" % (tok, expr))
+            top = st.pop()
+            second = st.pop()
+            if top == 0:
+                raise ZeroDivisionError(
+                    "%r in %r divides by zero; the interpreter does not guard "
+                    "this and its behaviour was not established" % (tok, expr))
+            q = _trunc_div(second, top)
+            st.append(_sx(q if tok == "/" else second - q * top))
             continue
         if tok == "~":
             if not st:
