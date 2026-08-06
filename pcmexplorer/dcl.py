@@ -566,11 +566,18 @@ RPN_HANDLERS = {
 
 #: Tokens whose behaviour has been read out of the handler machine code. Every
 #: other recognised character is deliberately unimplemented -- see `evaluate`.
-RPN_VERIFIED = frozenset("+-*/%^~&|=<>xDdM")
+RPN_VERIFIED = frozenset("+-*/%^~&|=<>?xDdM")
 
 #: Two-character tokens whose handlers have been read.
 RPN_VERIFIED_DIGRAPHS = frozenset(("<<", ">>", "<=", ">=",
-                                   "MR", "M+"))
+                                   "&&", "||", "MR", "M+"))
+
+#: The characters the interpreter recognises at all, recovered by emulating its
+#: dispatch -- a binary search over the character value, not a compare chain --
+#: for every printable byte. The result reproduces all 24 handler addresses in
+#: RPN_HANDLERS and finds no twenty-fifth, so the operator set is complete.
+#: Everything outside this set is skipped by the interpreter; see `evaluate`.
+RPN_RECOGNISED = frozenset(RPN_HANDLERS)
 
 
 def _trunc_div(a, b):
@@ -646,21 +653,40 @@ def evaluate(expr, ops, memory=0, strict=True):
     leaving ``second`` (which is 0) as the result. Division by zero is not
     guarded here, so this raises rather than inventing a value.
 
-    The comparison, memory, denial, rounding and averaging tokens have handlers
-    whose stack effects were not read, and still raise.
-    A previous version guessed at all of these and claimed confirmation against
-    "node 187", which turned out to be an artifact of a keying bug in
-    :func:`operands` -- the expression at that ident is not what was assumed.
-    Refusing is better than returning a number nobody can trust.
+    The logical pair is **not** C's truthiness. ``&&`` and ``||`` test each
+    operand with ``cmp/pl`` -- *greater than zero* -- so a negative operand is
+    false where C would call it true. ``?`` is different again: it tests its
+    condition with ``tst``, i.e. non-zero, and takes three operands, storing the
+    result to ``@r10`` (the third slot), so ``c a b ?`` is ``c ? a : b``.
 
-    Pass ``strict=False`` to skip unknown tokens instead of raising, which
-    matches the interpreter's own reject arm but will silently change the
-    result. Only useful for surveying which expressions are evaluable at all.
+    **Characters with no handler are no-ops, not errors.** The dispatch is a
+    binary search over the character value; emulating it across every printable
+    byte accepts exactly the 24 characters in :data:`RPN_HANDLERS` and finds no
+    twenty-fifth, so the operator set is complete. Everything else branches to
+    ``08906C1A`` -- which is the shared loop tail that ordinary operators return
+    through as well, not an error arm. It increments the character index and
+    branches back to the loop head, leaving the stack untouched.
+
+    That resolves ``'``, which appears in shipped expressions such as
+    ``xx*xx*xx*|'|`` yet has no handler: the record length fields prove it is
+    genuine payload rather than a slicing artifact, and it is simply skipped.
+    The sole exception is an empty stack, where the arm is entered with T set
+    from a ``tst r12,r12`` delay slot and exits through the error report.
+
+    The rounding, averaging and inversion tokens (``!``, ``i``, ``o``, ``r``,
+    ``a``, ``A``, ``m``) have handlers whose stack effects were not read, and
+    still raise. A previous version guessed at all of these and claimed
+    confirmation against "node 187", which turned out to be an artifact of a
+    keying bug in :func:`operands` -- the expression at that ident is not what
+    was assumed. Refusing is better than returning a number nobody can trust.
+
+    Pass ``strict=False`` to skip those recognised-but-unread tokens instead of
+    raising. That is not the same as the no-op path above: it will silently
+    change the result, and is only useful for surveying evaluability.
 
     Digraphs (``&&``, ``||``, ``>=``, ``>>``, ``<<``, ``<=``, ``MR`` ...) are
     handled by the *first* character's handler peeking the next one, confirmed
-    by `cmp/eq` against the following character inside each handler. They are
-    recognised here so they are not mis-split, then refused.
+    by `cmp/eq` against the following character inside each handler.
     """
     st, i, k, n = [], 0, 0, len(expr)
     denial = False
@@ -732,12 +758,15 @@ def evaluate(expr, ops, memory=0, strict=True):
                 raise ValueError("stack underflow at %r in %r" % (tok, expr))
             top = st.pop()
             second = st.pop()
-            n = top & 31            # SH shld/shad take the low 5 bits
+            # Not `n`: that is the loop bound. Assigning it here ended the walk
+            # early on every expression containing a shift, silently returning
+            # a partial result rather than raising.
+            sh = top & 31           # SH shld/shad take the low 5 bits
             if tok == "<<":
-                st.append(_sx(second << n))
+                st.append(_sx(second << sh))
             else:
                 # `neg` then `shad` -- arithmetic, so the sign propagates.
-                st.append(_sx(second >> n))
+                st.append(_sx(second >> sh))
             continue
         if tok in ("/", "%"):
             if len(st) < 2:
@@ -756,16 +785,60 @@ def evaluate(expr, ops, memory=0, strict=True):
                 raise ValueError("stack underflow at '~' in %r" % expr)
             st.append(_sx(~st.pop()))
             continue
+        if tok in ("&&", "||"):
+            if len(st) < 2:
+                raise ValueError("stack underflow at %r in %r" % (tok, expr))
+            top = st.pop()
+            second = st.pop()
+            # `cmp/pl`, which is "greater than zero", NOT "non-zero". A negative
+            # operand is false here where C would call it true. Read from
+            # 0890650C/08906572; both then join the shared binary epilogue, so
+            # each pops two and pushes one.
+            a, b = second > 0, top > 0
+            st.append(int(a and b if tok == "&&" else a or b))
+            continue
+        if tok == "?":
+            if len(st) < 3:
+                raise ValueError("stack underflow at '?' in %r" % expr)
+            top = st.pop()
+            second = st.pop()
+            cond = st.pop()
+            # 08906782: `tst r1,r1` on the third slot -- this one really is
+            # non-zero, unlike && and ||. The result is stored to @r10, the
+            # third slot, so `c a b ?` pops three and pushes one.
+            st.append(second if cond != 0 else top)
+            continue
 
-        if strict:
-            known = tok in RPN_HANDLERS or tok in RPN_DIGRAPHS
-            raise NotImplementedError(
-                "token %r in %r is %s; its stack effect has not been read from "
-                "the firmware, so evaluating would be a guess"
-                % (tok, expr,
-                   "recognised by the interpreter (handler %s)"
-                   % ("0x%08X" % RPN_HANDLERS[tok] if tok in RPN_HANDLERS
-                      else "digraph") if known else "not recognised"))
+        if tok in RPN_HANDLERS or tok in RPN_DIGRAPHS:
+            if strict:
+                raise NotImplementedError(
+                    "token %r in %r is recognised by the interpreter "
+                    "(handler %s); its stack effect has not been read from the "
+                    "firmware, so evaluating would be a guess"
+                    % (tok, expr,
+                       "0x%08X" % RPN_HANDLERS[tok] if tok in RPN_HANDLERS
+                       else "digraph"))
+            continue
+
+        # Not recognised by the interpreter at all. Its dispatch is a binary
+        # search over the character value; emulating that tree for every
+        # printable byte accepts exactly the 24 characters in RPN_HANDLERS and
+        # sends the rest to the arm at 08906C1A -- which is the *shared loop
+        # tail* that ordinary operators also return through, not an error path.
+        # It advances the character index and loops (`bra 0x89062c4`), so the
+        # character is skipped with the stack untouched.
+        #
+        # This is why "'" appears in shipped expressions such as `xx*xx*xx*|'|`
+        # while having no handler: it is a no-op. The record length fields
+        # confirm it is genuine payload and not a slicing artifact.
+        #
+        # The one exception is an empty stack: the arm is entered with T set
+        # from a `tst r12,r12` delay slot, and depth zero exits through the
+        # error report instead of looping.
+        if not st:
+            raise ValueError(
+                "unrecognised token %r in %r reached with an empty stack; the "
+                "interpreter exits through its error report here" % (tok, expr))
     if not st:
         raise ValueError("expression %r produced no value" % expr)
     return st[-1]
@@ -787,7 +860,10 @@ def evaluable(expr):
             continue
         tok = expr[i]
         i += 1
-        if tok not in RPN_VERIFIED:
+        # A character the interpreter does not recognise is a no-op, not an
+        # obstacle: it is skipped by the shared loop tail. Only a character it
+        # *does* dispatch, but whose handler has not been read, blocks us.
+        if tok in RPN_RECOGNISED and tok not in RPN_VERIFIED:
             return False
     return True
 
