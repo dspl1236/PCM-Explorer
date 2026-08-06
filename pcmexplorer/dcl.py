@@ -566,7 +566,10 @@ RPN_HANDLERS = {
 
 #: Tokens whose behaviour has been read out of the handler machine code. Every
 #: other recognised character is deliberately unimplemented -- see `evaluate`.
-RPN_VERIFIED = frozenset("+-*/%^~&|=x")
+RPN_VERIFIED = frozenset("+-*/%^~&|=<>x")
+
+#: Two-character tokens whose handlers have been read.
+RPN_VERIFIED_DIGRAPHS = frozenset(("<<", ">>", "<=", ">="))
 
 
 def _trunc_div(a, b):
@@ -694,6 +697,28 @@ def evaluate(expr, ops, strict=True):
             else:
                 st.append(int(second == top))
             continue
+        if tok in ("<", ">", "<=", ">="):
+            if len(st) < 2:
+                raise ValueError("stack underflow at %r in %r" % (tok, expr))
+            top = st.pop()
+            second = st.pop()
+            # SH cmp/gt and cmp/ge are signed, and _sx has already made these
+            # signed, so plain Python comparison matches.
+            st.append(int({"<": second < top, ">": second > top,
+                           "<=": second <= top, ">=": second >= top}[tok]))
+            continue
+        if tok in ("<<", ">>"):
+            if len(st) < 2:
+                raise ValueError("stack underflow at %r in %r" % (tok, expr))
+            top = st.pop()
+            second = st.pop()
+            n = top & 31            # SH shld/shad take the low 5 bits
+            if tok == "<<":
+                st.append(_sx(second << n))
+            else:
+                # `neg` then `shad` -- arithmetic, so the sign propagates.
+                st.append(_sx(second >> n))
+            continue
         if tok in ("/", "%"):
             if len(st) < 2:
                 raise ValueError("stack underflow at %r in %r" % (tok, expr))
@@ -736,7 +761,10 @@ def evaluable(expr):
     while i < n:
         tok = expr[i:i + 2]
         if tok in RPN_DIGRAPHS:
-            return False                        # none are implemented yet
+            if tok not in RPN_VERIFIED_DIGRAPHS:
+                return False
+            i += 2
+            continue
         tok = expr[i]
         i += 1
         if tok not in RPN_VERIFIED:
