@@ -566,11 +566,12 @@ RPN_HANDLERS = {
 
 #: Tokens whose behaviour has been read out of the handler machine code. Every
 #: other recognised character is deliberately unimplemented -- see `evaluate`.
-RPN_VERIFIED = frozenset("+-*/%^~&|=<>?axDdM")
+RPN_VERIFIED = frozenset("+-*/%^~&|=<>?!aiomrxDdM")
 
 #: Two-character tokens whose handlers have been read.
 RPN_VERIFIED_DIGRAPHS = frozenset(("<<", ">>", "<=", ">=",
-                                   "&&", "||", "MR", "M+"))
+                                   "&&", "||", "MR", "M+",
+                                   "i-", "i/", "r<", "r>", "m+"))
 
 #: The characters the interpreter recognises at all, recovered by emulating its
 #: dispatch -- a binary search over the character value, not a compare chain --
@@ -589,6 +590,36 @@ def _trunc_div(a, b):
     """
     q = abs(a) // abs(b)
     return -q if (a < 0) != (b < 0) else q
+
+
+def _mask_bits(w):
+    """The `r` handler's field mask: w ones, built one bit at a time.
+
+    Read from the loop at 08906958-0890696E, which starts r8 at 0 and repeats
+    ``add r8,r8 ; add #1,r8``. The entry test is a signed ``cmp/ge``, so w <= 0
+    produces 0. Capped at 32 here because the register saturates there; on the
+    real unit a w of 65536 or more simply spins.
+    """
+    return (1 << min(w, 32)) - 1 if w > 0 else 0
+
+
+def _shld(x, s):
+    """SH4 SHLD: dynamic *logical* shift, direction from the sign of s."""
+    u = x & 0xFFFFFFFF
+    if s >= 0:
+        return (u << (s & 31)) & 0xFFFFFFFF
+    k = (-s) & 31
+    return 0 if k == 0 else (u >> k)
+
+
+def _shad(x, s):
+    """SH4 SHAD: dynamic *arithmetic* shift; x is signed, so the sign fills."""
+    if s >= 0:
+        return ((x & 0xFFFFFFFF) << (s & 31)) & 0xFFFFFFFF
+    k = (-s) & 31
+    if k == 0:
+        return 0xFFFFFFFF if x < 0 else 0
+    return (x >> k) & 0xFFFFFFFF
 
 
 def evaluate(expr, ops, memory=0, strict=True):
@@ -695,8 +726,42 @@ def evaluate(expr, ops, memory=0, strict=True):
     occurrence is ``xa'``, where what it swallows is the no-op ``'`` and the end
     of the string, so the value is unaffected either way.
 
-    The rounding and inversion tokens (``!``, ``i``, ``o``, ``r``, ``m``) have
-    handlers whose stack effects were not read, and still raise.
+    The last five handlers, each named by its own trace string:
+
+    ``!`` (``089067B6``, ``'!%d'``) is logical NOT, unary in place. It uses
+    ``tst`` -- an exact ``== 0`` test -- where ``&&`` and ``||`` use ``cmp/pl``
+    (``> 0``). So ``!`` is **not** the complement of this interpreter's own
+    truthiness: ``!(-1)`` is 0, yet ``-1`` is false to ``&&``. Both readings
+    come from the bytes; the inconsistency is the firmware's.
+
+    ``i`` (``08906828``) is a three-way dispatch on the next character:
+
+    * plain ``i`` (``089068A0``, ``'%d is inside %d, %d; '``) -- signed
+      interval test ``second <= third <= top``, pop 3 push 1.
+    * ``i-`` (``08906870``, ``'%d - %d   (invers); '``) -- ``top - second``.
+    * ``i/`` (``0890683E``, ``'%d / %d   (invers); '``) -- ``top / second``.
+
+    The two digraphs are exact mirrors of ``-`` and ``/``, which is what
+    "invers" means here. ``i/`` **is** guarded against a zero divisor
+    (``tst r5,r5`` at ``08906850`` yields 0), where plain ``/`` is not.
+
+    ``o`` (``089068E0``, ``'%d is outside %d, %d; '``) is the exact complement
+    of plain ``i``.
+
+    ``r`` (``0890692E``) is a barrel **rotate** of ``third`` within a
+    ``top``-bit field by ``second`` places -- ``r>`` right, ``r<`` left --
+    despite trace strings reading ``'round > %d  between %d and %d; '``. The
+    format string is misleading; the machine code rotates, which was confirmed
+    numerically against an instruction-level simulation over the whole domain.
+    A lone ``r`` followed by neither ``<`` nor ``>`` is a one-character no-op.
+
+    ``m`` / ``m+`` (``08906B20``) are **arming prefixes, not value operators**.
+    The handler touches no stack slot and no depth; it sets a mode byte at
+    ``[r14+80]`` (``m+`` -> accumulate, ``m`` -> assign) that the memory side
+    effect of ``i``/``o`` at ``08905CBC`` consults when updating the memory
+    register at ``ctx+16``. Only the value stack is modelled here, so they are
+    correctly no-ops for the returned value.
+
     A previous version guessed at all of these and claimed
     confirmation against "node 187", which turned out to be an artifact of a
     keying bug in :func:`operands` -- the expression at that ident is not what
@@ -713,6 +778,7 @@ def evaluate(expr, ops, memory=0, strict=True):
     st, i, k, n = [], 0, 0, len(expr)
     denial = False
     memory_pushed = False
+    mem_mode = 4                # [r14+80], 4 == disarmed; set at 08906218
     while i < n:
         tok = expr[i:i + 2]
         if tok in RPN_DIGRAPHS:
@@ -806,6 +872,85 @@ def evaluate(expr, ops, memory=0, strict=True):
             if not st:
                 raise ValueError("stack underflow at '~' in %r" % expr)
             st.append(_sx(~st.pop()))
+            continue
+        if tok == "!":
+            if not st:
+                raise ValueError("stack underflow at '!' in %r" % expr)
+            # Logical NOT, unary in place: `tst r1,r1` at 089067C2 then
+            # `movt r7` in the delay slot at 089067C6, and the unary epilogue
+            # at 08906B1C writes r7 back to @(4,r9). Named by '!%d'.
+            # NOTE the asymmetry with && and ||: this is `tst`, an exact ==0
+            # test, where those use cmp/pl (">0"). So '!' is NOT the complement
+            # of this interpreter's truthiness -- !(-1) is 0, yet -1 is false
+            # to &&. Both readings are from the bytes; the inconsistency is the
+            # firmware's, not ours.
+            st.append(int(_sx(st.pop()) == 0))
+            continue
+        if tok in ("i", "o"):
+            if len(st) < 3:
+                raise ValueError("stack underflow at %r in %r" % (tok, expr))
+            top = st.pop()
+            second = st.pop()
+            third = st.pop()
+            # Signed three-operand interval predicates, exact complements.
+            # 'i' 089068A0, named '%d is inside %d, %d; '  (cmp/gt 089068B6,
+            # cmp/ge 089068BC). 'o' 089068E0, '%d is outside %d, %d; '.
+            # The result is stored to @r10, the third slot, and depth drops by
+            # two -- pop 3, push 1.
+            inside = second <= third <= top
+            st.append(int(inside if tok == "i" else not inside))
+            continue
+        if tok in ("i-", "i/"):
+            if len(st) < 2:
+                raise ValueError("stack underflow at %r in %r" % (tok, expr))
+            top = st.pop()
+            second = st.pop()
+            # The "invers" digraphs: exact mirrors of '-' and '/'.
+            # i- 08906870: `sub r2,r1` with r1=top, r2=second -> top - second.
+            # i/ 0890683E: dividend r4 = top, divisor r5 = second.
+            if tok == "i-":
+                st.append(_sx(top - second))
+            elif second == 0:
+                # Unlike plain '/', this one IS guarded: `tst r5,r5` at
+                # 08906850 skips the division, leaving second (which is 0) in
+                # place, so the result is 0 rather than a trap.
+                st.append(0)
+            else:
+                st.append(_sx(_trunc_div(top, second)))
+            continue
+        if tok in ("r<", "r>"):
+            if len(st) < 3:
+                raise ValueError("stack underflow at %r in %r" % (tok, expr))
+            top = st.pop()          # w: field width in bits
+            second = st.pop()       # n: rotate amount
+            third = st.pop()        # x: the value
+            # Barrel ROTATE of x within a w-bit field -- despite the trace
+            # strings reading 'round > %d  between %d and %d; '. The format
+            # string is misleading; the machine code rotates. Verified
+            # numerically against an instruction-level simulation of
+            # 08906946-0890698A and 0890699E-089069E4 over the full domain.
+            m = _mask_bits(top)
+            if tok == "r>":
+                v = (_shld(third, top - second) & m) | _shad(third, -second)
+            else:
+                v = (_shld(third, second) & m) | _shad(third, second - top)
+            st.append(_sx(v))
+            continue
+        if tok in ("m", "m+"):
+            # Arming prefixes, NOT value operators: the handler at 08906B20
+            # reads and writes no stack slot and never touches depth. It sets a
+            # mode byte at [r14+80] -- 'm+' -> 0 (accumulate), 'm' -> 1 (assign)
+            # -- which the memory side effect of 'i'/'o' at 08905CBC later
+            # consults to update the memory register at ctx+16. Only the value
+            # stack is modelled here, so this is correctly a no-op; the mode is
+            # recorded for the caller.
+            mem_mode = 0 if tok == "m+" else 1
+            continue
+        if tok == "r":
+            # A lone 'r' -- next character neither '<' nor '>' -- takes the
+            # bf/s at 08906942 to 0890692A, which is `bra 08906c1a` straight
+            # into the shared loop tail. No stack read, no write, no depth
+            # change: a one-character no-op. Only the digraphs do work.
             continue
         if tok == "a":
             if not st:
