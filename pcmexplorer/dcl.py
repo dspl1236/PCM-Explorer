@@ -511,6 +511,20 @@ def kwp_services(d):
     requestRoutineResults, ``0x3B`` writeDataByLocalIdentifier, ``0x1A``
     readEcuIdentification.
 
+    **Checked against a live PCM 3.1 on the bench.** The two-byte form is
+    confirmed: ``21 06``, ``21 0A``, ``21 0C``, ``21 11`` and ``21 F4`` are all
+    served and answer with data.
+
+    The one-byte form is **not** a local identifier, which the unit settled by
+    rejecting ``21 3C``, ``21 35`` and ``21 36`` with subFunctionNotSupported --
+    all three are keylen-1 keys, and reading them as ``21 <key>`` was my guess,
+    not something the file said. Only 14 of the 37 one-byte keys are standard
+    KWP service ids either, so what that form addresses is open.
+
+    Practical note for anyone querying these: the first request after a session
+    opens frequently comes back ``7F xx 21`` (busyRepeatRequest) or silent. It
+    is transient -- repeat and it answers.
+
     ``entry`` is a node number in the owning graph's block-local numbering, so
     it resolves through :func:`node_map` like any other. ``exprs`` lists the
     expression attributes reachable from it along code-6 edges.
@@ -520,6 +534,13 @@ def kwp_services(d):
     match as evidence and a mismatch as inconclusive -- reachability shows the
     expression is downstream of the request, not that its value is what the
     response carries.
+
+    That caveat turned out to be the whole story on the bench. ``21 06`` answers
+    ``80 01 06 00 00 15`` and ``21 0A`` answers twenty-one bytes: these are
+    multi-field records, so a prediction over *every* byte tests nothing. What
+    is still missing is the output layout -- which node's value lands in which
+    byte of the response. Until that is decoded, an expression can be shown to
+    sit downstream of a request but not tied to a field of its answer.
     """
     attrs = list(attributes(d))
     gs = graphs(d)
