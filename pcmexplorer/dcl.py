@@ -495,6 +495,70 @@ def operand_slots(d, gi, nd, _graphs=None):
     return flags
 
 
+def kwp_services(d):
+    """``[{key, keylen, entry, attr, exprs}, ...]`` -- the code-8 service table.
+
+    Code 8 is the bridge from a diagnostic request to the dataflow graph. The
+    firmware's mapper at ``08904264`` fails with ``"cannot map service id 0x%X
+    (size %d byte(s))"``, which names the first two fields::
+
+        u32 key ; u8 keylen ; u16 entry_node ; u16 extra          (9 bytes)
+
+    ``keylen`` is the request's length in bytes, and ``key`` is the request
+    itself: a ``keylen`` of 2 with key ``0x2106`` is the request ``21 06``.
+    Observed prefixes are the KWP services you would expect -- ``0x21``
+    readDataByLocalIdentifier, ``0x31`` routineControl, ``0x33``
+    requestRoutineResults, ``0x3B`` writeDataByLocalIdentifier, ``0x1A``
+    readEcuIdentification.
+
+    ``entry`` is a node number in the owning graph's block-local numbering, so
+    it resolves through :func:`node_map` like any other. ``exprs`` lists the
+    expression attributes reachable from it along code-6 edges.
+
+    This is what makes the model testable against a unit: a request whose
+    expression has known constants predicts something about the answer. Treat a
+    match as evidence and a mismatch as inconclusive -- reachability shows the
+    expression is downstream of the request, not that its value is what the
+    response carries.
+    """
+    attrs = list(attributes(d))
+    gs = graphs(d)
+
+    expr_at = {}
+    for j, (o, path, vals) in enumerate(attrs):
+        for vo, c, b in vals:
+            if c == 0x23:
+                t = _string_value(b).decode("latin1")
+                if t:
+                    expr_at[j] = t
+
+    fwd = defaultdict(lambda: defaultdict(set))
+    for gi, g in gs.items():
+        for r in g["rows"]:
+            if r[0] == 6:
+                fwd[gi][r[2]].add(r[4])
+
+    out = []
+    for gi, (o, path, vals) in enumerate(attrs):
+        for vo, c, b in vals:
+            if c != 8 or len(b) < 9:
+                continue
+            key, klen = struct.unpack_from("<IB", b, 0)
+            entry = struct.unpack_from("<H", b, 5)[0]
+            S = gs[gi]["S"] if gi in gs else 0
+            seen, stack = {entry}, [entry]
+            while stack:
+                for nxt in fwd[gi].get(stack.pop(), ()):
+                    if nxt not in seen:
+                        seen.add(nxt)
+                        stack.append(nxt)
+            out.append({"key": key, "keylen": klen, "entry": entry,
+                        "attr": entry + S, "graph": gi,
+                        "exprs": sorted((n + S, expr_at[n + S]) for n in seen
+                                        if n + S in expr_at)})
+    return out
+
+
 def expression_operands(d):
     """``[(attr_index, offset, text, slots), ...]`` -- every expression, bound.
 
