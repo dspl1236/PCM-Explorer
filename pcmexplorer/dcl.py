@@ -111,12 +111,18 @@ a byte-order conversion: one dynamic source repeated three times against masks
 That it lands on a recognisable idiom, rather than plausible-looking numbers, is
 the strongest evidence the binding is right -- a misaligned map yields garbage.
 
-The honest boundary is the node map itself, which is **fitted**.  It is heavily
-constrained -- it tiles all 2900 attributes exactly once, its 237 independently
-computed ``S`` values collapse to 7, and a one-attribute misalignment drops
-binding from 52 to 19 -- but the firmware establishes only that node numbers are
-dense indices into a pointer vector, and the obvious derivation of that vector
-does not reproduce the map.  See :func:`node_map`.
+The node map is **derived**, not fitted.  Code-4 and code-9 records frame the
+stream into seven config blocks -- the same seven named in the header -- and a
+block boundary recreates the node vector, which is the reset that makes
+numbering restart.  ``S`` is constant within every span, distinct across all
+seven, and equals that span's marker attribute index in 7 of 7 cases.  The
+earlier per-graph form ``S = gi - nmax - 1`` is numerically identical (0
+disagreements over 237 graphs) but was a free parameter per graph, so it had to
+be reported as fitted.  See :func:`blocks` and :func:`node_map`.
+
+What remains unsupported is small and named: the ``n == base`` special case is
+a tie-break the firmware does not justify, and the map without it scores
+identically on the arity-free signature test.
 
 Still not established: whether the KWP SecurityAccess seed/key derivation lives
 in this file.  No evidence either way.
@@ -334,13 +340,41 @@ def operands(d):
     return out
 
 
+def blocks(d):
+    """Attribute indices at which each config block begins.
+
+    The stream is partitioned into blocks by code-4 and code-9 records -- the
+    block framing the firmware's configurator reads. There are exactly seven in
+    the shipped file, matching the seven entry names in the header.
+
+    The marker sits in the **last** attribute of the block it closes, and that
+    same attribute index is where the next block's node numbering starts from.
+    Both facts are needed: membership tests are strict (a graph belongs to the
+    block whose marker index is strictly below it), while the returned index is
+    the origin the next block counts from.
+    """
+    out = [0]
+    for i, (o, path, vals) in enumerate(attributes(d)):
+        if any(c in (4, 9) for _, c, _ in vals):
+            out.append(i)
+    return sorted(set(out))
+
+
 def graphs(d):
     """``attr_index -> {rows, base, nmax, S}`` for every dataflow graph.
 
     A graph attribute is one holding code-6 or code-7 records. Node numbers are
-    **local to the graph**, and the whole binding problem turns on converting
+    **local to the block**, and the whole binding problem turns on converting
     them to attribute indices; see :func:`node_map`.
+
+    ``S`` is the origin: attribute index of the marker of the block this graph
+    belongs to. It is **derived**, not fitted. The equivalent per-graph formula
+    ``S = gi - nmax - 1`` reproduces it exactly on all 237 graphs, but that form
+    invites recovering a free parameter per graph; the block origin explains
+    *why* the values collapse to seven, and why they collapse to exactly the
+    number of config blocks.
     """
+    bl = blocks(d)
     out = {}
     for gi, (o, path, vals) in enumerate(attributes(d)):
         rows = []
@@ -359,29 +393,41 @@ def graphs(d):
         if not rows:
             continue
         ns = {r[2] for r in rows} | {r[4] for r in rows}
+        # Strict: the marker's own attribute closes its block, so a graph
+        # sitting on a boundary belongs to the block before it, not after.
+        origin = max((x for x in bl if x < gi), default=0)
         out[gi] = {"rows": rows, "offset": o, "base": min(ns), "nmax": max(ns),
-                   "S": gi - max(ns) - 1}
+                   "S": origin}
     return out
 
 
 def node_map(d):
     """``(attr2node, node2attr)`` -- node numbers <-> attribute indices.
 
-    For a graph at attribute index ``gi`` with largest referenced node
-    ``nmax``, ``S = gi - nmax - 1`` and ``attr(n) = gi if n == base else n + S``.
+    ``attr(n) = gi if n == base else n + S``, where ``S`` is the origin of the
+    block the graph belongs to -- see :func:`blocks`.
 
-    **This map is fitted, and that is the rule's honest boundary.** It is very
-    heavily constrained -- it tiles all 2900 attributes exactly once with no
-    duplicates or gaps, the 237 independently computed ``S`` values collapse to
-    just 7, and misaligning it by a single attribute collapses expression
-    binding from 52 to 19 -- but the firmware establishes only that node numbers
-    are dense indices into a pointer vector, and the first-principles derivation
-    of that vector does *not* reproduce this map. Something reorders it that has
-    not been located. Treat the map as a well-tested premise, not as read.
+    **The map is derived, not fitted.** The firmware says node numbers are
+    dense indices into a vector; a block boundary recreates that vector, which
+    is the reset that makes numbering restart. Concretely, the seven code-4/9
+    markers cut the file into seven spans, ``S`` is constant within every span
+    and distinct across all seven, and it equals the attribute index of that
+    span's marker in 7 of 7 cases.
 
-    Dropping the ``-1`` is the trap: that variant still satisfies
-    ``base == min(node)`` on 237/237 graphs and still yields exactly 7 ``S``
-    values, so every endpoint check passes while interior binding collapses.
+    An earlier revision recovered ``S = gi - nmax - 1`` per graph instead. That
+    is numerically identical -- 0 disagreements over all 237 graphs, and the two
+    maps are equal entry for entry -- but it is a free parameter per graph that
+    happens to collapse to seven values, which is why it had to be reported as
+    fitted. The block origin explains *why* there are seven.
+
+    Two traps, both of which pass every endpoint check while breaking interior
+    binding. Dropping the ``-1`` from the old formula still satisfies
+    ``base == min(node)`` on 237/237 and still yields exactly 7 values. And
+    block membership must be **strict**: the marker's attribute closes its own
+    block, so testing ``<=`` instead of ``<`` misassigns every boundary graph.
+
+    The ``n == base`` special case remains a tie-break with no firmware support;
+    the map without it scores identically on the arity-free signature test.
     """
     attr2node, node2attr = {}, {}
     for gi, g in graphs(d).items():
