@@ -580,6 +580,137 @@ def kwp_services(d):
     return out
 
 
+#: Scalar field widths, read from the jump table the firmware's
+#: ``CDiagParam::getByteSize`` (``08900734``) branches through: 16 entries at
+#: ``0890074C`` with braf base ``0890074A``. Types 9-14 take the length field at
+#: ``[this+8]`` instead, i.e. they are variable and the config does not carry
+#: their size.
+DIAG_WIDTH = {0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2, 8: 3, 6: 4, 7: 4, 15: 4}
+
+#: Buffer types whose length the IO subsystem supplies at run time.
+DIAG_VARIABLE = frozenset((9, 10, 11, 12, 13, 14, 18))
+
+
+def _owning_record(vals):
+    """The value record of an attribute: the last one, codes >= 0x20.
+
+    A trailing path list belongs to the record before it, so an attribute is a
+    run of graph records followed by the one value record that owns the path.
+    """
+    for vo, c, b in reversed(vals):
+        if c >= 0x20:
+            return c, b
+    return None, None
+
+
+def node_width(d, gi, n, _ctx=None, _depth=0):
+    """Byte width of a node's contribution to a response, or None if runtime.
+
+    The firmware never stores a response length: ``CDiagParams::getByteSize``
+    (``08901348``) is a pure sum over the parameter list, and each parameter's
+    width comes from its type through ``CDiagParam::getByteSize``
+    (``08900734``). So the length is reconstructed here the same way -- by
+    summing widths -- rather than looked up.
+
+    Returns ``None`` for a variable-width buffer, which is an abstention rather
+    than a failure: for a type-18 signal the length genuinely is not in the
+    file, and inventing a constant for it is how a fitted parameter gets in.
+    """
+    if _ctx is None:
+        attrs = list(attributes(d))
+        _ctx = (attrs, graphs(d), node_map(d)[0])
+    attrs, gs, a2n = _ctx
+    if _depth > 12 or gi not in gs:
+        return None
+    a = n + gs[gi]["S"]
+    if not (0 <= a < len(attrs)):
+        return None
+    code, body = _owning_record(attrs[a][2])
+
+    if code == 0x28 and len(body) >= 16:                 # CRBDiagIOSub
+        t = struct.unpack_from("<i", body, 12)[0]
+        if t in DIAG_VARIABLE:
+            return None
+        return DIAG_WIDTH.get(t, 1)
+    if code == 0x26 and len(body) >= 8:                  # CRBDiagFormat
+        return max(1, struct.unpack_from("<H", body, 6)[0] // 8)
+    if code in (0x24, 0x31, 0x23, 0x2c, 0x25):           # Const / RPN / char
+        return 1
+    if code == 0x2f:                                     # CRBDiagTable
+        return _table_length(body)
+    if code in (0x22, 0x2b):                             # Collector / Pass
+        # A Pass node often carries a declared format table on port 1. That is
+        # the second mechanism, and it covers what summing widths cannot: the
+        # fixed-width text buffers, where the structural walk abstains.
+        for r in gs[gi]["rows"]:
+            if r[4] == n and r[5] == 1:
+                w = node_width(d, gi, r[2], _ctx, _depth + 1)
+                if w:
+                    return w
+        tot = 0
+        for r in gs[gi]["rows"]:
+            if r[4] != n or r[5] != 0:
+                continue
+            w = (1 if (r[0] == 7 and r[8])               # a const occupies 1
+                 else node_width(d, gi, r[2], _ctx, _depth + 1))
+            if w is None:
+                return None
+            tot += w
+        return tot or None
+    return None
+
+
+def _table_length(body):
+    """Response length from a ``0x2f`` format table, or None.
+
+    ``0x2f`` is CRBDiagTable, not a plain u32 list: ``u16 kind ; u16 ncols ;
+    u16 n ; u32[n]`` with ``n = nrows * ncols``. A ``kind`` of 1 with two
+    columns is the response format, and the sum of column 1 over its rows is
+    the byte length.
+    """
+    if len(body) < 6:
+        return None
+    kind, ncols, n = struct.unpack_from("<3H", body, 0)
+    if kind != 1 or ncols != 2 or n < 2 or len(body) < 6 + 4 * n:
+        return None
+    vals = struct.unpack_from("<%dI" % n, body, 6)
+    return sum(vals[1::2]) or None
+
+
+def response_length(d, key, keylen=2):
+    """Predicted byte length of the answer to a KWP request, or None.
+
+    The response producers are the sources of every code-6/code-7 row aimed at
+    the service's entry node on **port 1** -- a destination port is a function
+    index, and function 1 on ``CRBDiagService`` is Response. Multiple producers
+    are mutually exclusive outcome paths rather than concatenated fields, so
+    they must agree; where they disagree this returns the one they agree on
+    most, and callers should treat a split as a warning.
+
+    Validated against a live PCM 3.1. Out of sample it predicted ``21 00`` = 1
+    and ``21 16`` = 11 while both were unserved, and a later bench run measured
+    exactly those.
+    """
+    attrs = list(attributes(d))
+    gs = graphs(d)
+    ctx = (attrs, gs, node_map(d)[0])
+    for s in kwp_services(d):
+        if s["key"] != key or s["keylen"] != keylen:
+            continue
+        gi, E = s["graph"], s["entry"]
+        if gi not in gs:
+            continue
+        widths = []
+        for r in gs[gi]["rows"]:
+            if r[4] == E and r[5] == 1:
+                w = node_width(d, gi, r[2], ctx)
+                if w:
+                    widths.append(w)
+        if widths:
+            return max(set(widths), key=widths.count)
+    return None
+
+
 def expression_operands(d):
     """``[(attr_index, offset, text, slots), ...]`` -- every expression, bound.
 
