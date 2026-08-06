@@ -265,20 +265,38 @@ def attributes(d):
     """Yield ``(offset, path, values)`` -- one attribute and everything under it.
 
     `path` is a list of ``(slot, ident, cls)``; `values` is the list of
-    ``(offset, code, body)`` records between this path record and the next.
-    One path can own hundreds of values: a whole dataflow graph is a single
-    attribute.
+    ``(offset, code, body)`` records the path belongs to. One path can own
+    hundreds of values: a whole dataflow graph is a single attribute.
+
+    **The path is a trailing field of the records BEFORE it, not a header for
+    the records after it.** Every configurator case for code >= 0x20 ends by
+    reading ``u16 n ; u32[n]``, while codes 6/7/8/9/0x0a do not, so what looks
+    like a standalone "path record" of code n is that trailing list. The bytes
+    are identical either way, which is why walking it as a separate record still
+    reached 100% coverage and the error went unnoticed -- but every path was
+    attributed to the following record instead of its own.
+
+    Confirmed on the shipped file in both directions with zero exceptions:
+    2900 of 2900 records with code >= 0x20 are immediately followed by a path
+    record, 2900 of 2900 path records are immediately preceded by one, and the
+    body length is exactly ``4 * code``.
+
+    This relabels groups rather than re-partitioning them, so membership is
+    unchanged and every index shifts by one -- which :func:`node_map` absorbs
+    into ``S``, leaving the operand binding intact.
     """
-    cur = None
+    pend = []
     for o, code, body in records(d):
         if code in PATH_CODES:
-            if cur is not None:
-                yield cur
-            cur = (o, path_elems(body), [])
-        elif cur is not None:
-            cur[2].append((o, code, body))
-    if cur is not None:
-        yield cur
+            # The path CLOSES the run before it; it does not open the run after.
+            yield (pend[0][0] if pend else o, path_elems(body), pend)
+            pend = []
+        else:
+            pend.append((o, code, body))
+    if pend:
+        # Records after the final path list. None exist in any shipped file,
+        # but a truncated one would land here rather than vanishing.
+        yield (pend[0][0], [], pend)
 
 
 def edges(d):
@@ -487,6 +505,11 @@ def nodes(d):
     """
     out = defaultdict(list)
     for o, path, vals in attributes(d):
+        if not path:
+            # The final run has no path: the file ends on block framing rather
+            # than on another trailing list. Its records are real (a graph plus
+            # a code-9), but they name no object, so there is nothing to key on.
+            continue
         slot, ident, cls = path[0]
         for vo, code, body in vals:
             out[(cls & 0x7F, ident)].append((vo, slot, code, body))
