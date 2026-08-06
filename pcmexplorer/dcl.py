@@ -690,9 +690,17 @@ def _table_length(body):
 #: and neither ifs1 nor ifs2 carries an IO-subsystem declaration file. The
 #: length is supplied by the IO subsystem at run time.
 #:
-#: Worth noting: this one's value was byte-identical across two bench runs
-#: (``20 32 1a 25 5a 69``) where ``21 12`` and ``21 FE`` both changed, so it is
-#: a static identifier rather than live data.
+#: Confirmed on a **second, different** PCM (part number ``99164217822`` against
+#: the first unit's ``7P5035884AB``): ``21 1B`` answered six bytes there too,
+#: with a different value -- ``20 32 1d 1e 5a 64`` against ``20 32 1a 25 5a 69``.
+#: So the width is fixed at 6 for signal 20193 even though type 18 is nominally
+#: variable, and the payload is a per-unit identifier. Bytes 0, 1 and 4 are
+#: identical across both units.
+#:
+#: That second unit also cross-validates the derived rule: every measured length
+#: matched between the two (1A91=11, 1A93=8, 1A95=8, 21 1B=6, 21 12=3,
+#: 21 FE=2, 21 06=6, 21 0A=21, 21 29=33, 21 16=11, 21 00=1), so response layout
+#: is stable across hardware variants and software versions.
 MEASURED_LENGTH = {0x211B: 6}
 
 
