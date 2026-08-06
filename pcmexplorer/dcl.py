@@ -566,7 +566,7 @@ RPN_HANDLERS = {
 
 #: Tokens whose behaviour has been read out of the handler machine code. Every
 #: other recognised character is deliberately unimplemented -- see `evaluate`.
-RPN_VERIFIED = frozenset("+-*/%^~&|=<>?xDdM")
+RPN_VERIFIED = frozenset("+-*/%^~&|=<>?axDdM")
 
 #: Two-character tokens whose handlers have been read.
 RPN_VERIFIED_DIGRAPHS = frozenset(("<<", ">>", "<=", ">=",
@@ -673,9 +673,31 @@ def evaluate(expr, ops, memory=0, strict=True):
     The sole exception is an empty stack, where the arm is entered with T set
     from a ``tst r12,r12`` delay slot and exits through the error report.
 
-    The rounding, averaging and inversion tokens (``!``, ``i``, ``o``, ``r``,
-    ``a``, ``A``, ``m``) have handlers whose stack effects were not read, and
-    still raise. A previous version guessed at all of these and claimed
+    ``a`` and ``A`` are named by the interpreter's own trace strings --
+    ``'absolut %d; '`` at ``0952ACB4`` and ``'Average; '`` at ``0952ACC4``.
+
+    ``a`` is absolute value, unary in place, and is implemented.
+
+    ``A`` is **read but deliberately not implemented.** It averages only when it
+    is the last character of the expression, or the second-to-last followed by
+    ``'`` (``08906A6A`` / ``08906A72`` / ``08906A7C``) -- exactly the shape
+    ``xA'``. It then drains the stack into a sum at ``r14+124`` with a count in
+    r13 and divides through ``__sdivsi3_i4``. But the ``depth--`` at ``08906A82``
+    happens *before* the loop guard, so on a one-element stack the loop never
+    runs and the count stays zero: a bare ``xA'`` would divide by zero. The
+    operator only yields a value once the dataflow node array at ``ctx+84``
+    contributes, which is the same reason the nine-placeholder expressions
+    cannot be evaluated standalone. Refusing is the correct outcome here, not a
+    gap in the reading.
+
+    Both also consume more than one character: ``a`` advances the index by two
+    at ``08906A2E`` on top of the tail's one. In the shipped data its only
+    occurrence is ``xa'``, where what it swallows is the no-op ``'`` and the end
+    of the string, so the value is unaffected either way.
+
+    The rounding and inversion tokens (``!``, ``i``, ``o``, ``r``, ``m``) have
+    handlers whose stack effects were not read, and still raise.
+    A previous version guessed at all of these and claimed
     confirmation against "node 187", which turned out to be an artifact of a
     keying bug in :func:`operands` -- the expression at that ident is not what
     was assumed. Refusing is better than returning a number nobody can trust.
@@ -784,6 +806,15 @@ def evaluate(expr, ops, memory=0, strict=True):
             if not st:
                 raise ValueError("stack underflow at '~' in %r" % expr)
             st.append(_sx(~st.pop()))
+            continue
+        if tok == "a":
+            if not st:
+                raise ValueError("stack underflow at 'a' in %r" % expr)
+            # Absolute value, unary in place: 08906A26 loads @(4,r9) as the
+            # argument and 08906A28 stores the result straight back to it, so
+            # the depth is untouched. Named by its own trace string,
+            # 'absolut %d; ' at 0952ACB4.
+            st.append(_sx(abs(st.pop())))
             continue
         if tok in ("&&", "||"):
             if len(st) < 2:
