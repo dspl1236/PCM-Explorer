@@ -141,11 +141,11 @@ from collections import defaultdict
 #: derived by contiguous hand-decode and then confirmed by the walk landing
 #: exactly on EOF in all fifteen files.
 CODE_SIZE = {
-    1: 4, 2: 8, 3: 12,          # path, 1/2/3 elements
-    4: 2,
+    1: 4, 2: 8, 3: 12,          # trailing path list, 1/2/3 elements
+    4: 0, 5: 0,                 # eCfgEnd, eFileEnd -- bare block tags
     6: 10,                      # dataflow edge
     7: 21,                      # operand binding
-    8: 9, 9: 8, 0x0a: 4,
+    8: 9, 9: 4, 0x0a: 4,
     0x20: 8, 0x21: 20, 0x22: 0, 0x23: "str", 0x24: 8, 0x25: 1,
     0x26: "u16list", 0x28: 17, 0x29: 4, 0x2a: "str", 0x2b: 0, 0x2c: 1,
     0x2d: "range", 0x2e: 2, 0x2f: "u32list", 0x30: 0, 0x31: 8, 0x32: 0,
@@ -226,8 +226,17 @@ def stream_start(d):
 # record stream
 # --------------------------------------------------------------------------
 
-def body_len(d, code, o):
-    """Body length of `code` whose body starts at `o`, or None if unknown."""
+def body_len(d, code, o, prev=None):
+    """Body length of `code` whose body starts at `o`, or None if unknown.
+
+    `prev` is the preceding record's code, needed for one genuine ambiguity:
+    **code 3 is both a three-element trailing path list and the ``eCfg`` block
+    tag.** They are told apart by context -- a block tag only ever follows the
+    ``eCfgEnd`` tag (code 4), and a trailing list only ever follows the record
+    it belongs to. Nothing in the two bytes themselves distinguishes them.
+    """
+    if code == 3 and prev == 4:
+        return 0                                      # eCfg, a bare block tag
     s = CODE_SIZE.get(code)
     if s is None:
         return None
@@ -252,13 +261,15 @@ def records(d, start=None):
     """
     o = stream_start(d) if start is None else start
     n = len(d)
+    prev = None
     while o + 2 <= n:
         code = struct.unpack_from("<H", d, o)[0]
-        ln = body_len(d, code, o + 2)
+        ln = body_len(d, code, o + 2, prev)
         if ln is None or o + 2 + ln > n:
             raise ValueError("unknown record code %#x at %#x" % (code, o))
         yield o, code, d[o + 2:o + 2 + ln]
         o += 2 + ln
+        prev = code
 
 
 def path_elems(body):
@@ -293,7 +304,10 @@ def attributes(d):
     """
     pend = []
     for o, code, body in records(d):
-        if code in PATH_CODES:
+        # A code-3 with an empty body is the eCfg block tag, not a path list.
+        # Treating it as a path inserts six spurious attribute boundaries and
+        # shifts every index after them.
+        if code in PATH_CODES and body:
             # The path CLOSES the run before it; it does not open the run after.
             yield (pend[0][0] if pend else o, path_elems(body), pend)
             pend = []
@@ -404,8 +418,8 @@ def graphs(d):
 def node_map(d):
     """``(attr2node, node2attr)`` -- node numbers <-> attribute indices.
 
-    ``attr(n) = gi if n == base else n + S``, where ``S`` is the origin of the
-    block the graph belongs to -- see :func:`blocks`.
+    ``attr(n) = n + S``, where ``S`` is the origin of the block the graph
+    belongs to -- see :func:`blocks`.
 
     **The map is derived, not fitted.** The firmware says node numbers are
     dense indices into a vector; a block boundary recreates that vector, which
@@ -426,13 +440,16 @@ def node_map(d):
     block membership must be **strict**: the marker's attribute closes its own
     block, so testing ``<=`` instead of ``<`` misassigns every boundary graph.
 
-    The ``n == base`` special case remains a tie-break with no firmware support;
-    the map without it scores identically on the arity-free signature test.
+    An ``n == base`` special case used to sit here as an unexplained tie-break.
+    It is gone: with it and without it the map tiles 2900 attributes with zero
+    duplicates, scores 5 signatures at 100.0% purity with nothing unresolved,
+    and binds 52 expressions with 49 exact and the same three residuals. It
+    changed nothing, so it was carrying no information.
     """
     attr2node, node2attr = {}, {}
     for gi, g in graphs(d).items():
         for n in range(g["base"], g["nmax"] + 1):
-            a = gi if n == g["base"] else n + g["S"]
+            a = n + g["S"]
             node2attr[(gi, n)] = a
             attr2node[a] = (gi, n)
     return attr2node, node2attr
@@ -697,13 +714,18 @@ def _walk(d):
     report *where* a future variant diverges rather than just failing.
     """
     o, n, out = stream_start(d), len(d), []
+    prev = None
     while o + 2 <= n:
         code = struct.unpack_from("<H", d, o)[0]
-        ln = body_len(d, code, o + 2)
+        # Must track `prev` exactly as records() does: without it a bare code-3
+        # block tag is read as a 12-byte path list and the walk desynchronises
+        # nine records in.
+        ln = body_len(d, code, o + 2, prev)
         if ln is None or o + 2 + ln > n:
             return out, o, code
         out.append((o, code, 2 + ln))
         o += 2 + ln
+        prev = code
     return out, o, None
 
 
