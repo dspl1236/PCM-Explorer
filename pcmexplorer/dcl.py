@@ -566,10 +566,11 @@ RPN_HANDLERS = {
 
 #: Tokens whose behaviour has been read out of the handler machine code. Every
 #: other recognised character is deliberately unimplemented -- see `evaluate`.
-RPN_VERIFIED = frozenset("+-*/%^~&|=<>x")
+RPN_VERIFIED = frozenset("+-*/%^~&|=<>xDdM")
 
 #: Two-character tokens whose handlers have been read.
-RPN_VERIFIED_DIGRAPHS = frozenset(("<<", ">>", "<=", ">="))
+RPN_VERIFIED_DIGRAPHS = frozenset(("<<", ">>", "<=", ">=",
+                                   "MR", "M+"))
 
 
 def _trunc_div(a, b):
@@ -583,7 +584,7 @@ def _trunc_div(a, b):
     return -q if (a < 0) != (b < 0) else q
 
 
-def evaluate(expr, ops, strict=True):
+def evaluate(expr, ops, memory=0, strict=True):
     """Evaluate an RPN template, using only semantics verified from the firmware.
 
     The template interpreter in `PCM3Reload` is a **stack machine**, not a
@@ -662,6 +663,8 @@ def evaluate(expr, ops, strict=True):
     recognised here so they are not mis-split, then refused.
     """
     st, i, k, n = [], 0, 0, len(expr)
+    denial = False
+    memory_pushed = False
     while i < n:
         tok = expr[i:i + 2]
         if tok in RPN_DIGRAPHS:
@@ -696,6 +699,23 @@ def evaluate(expr, ops, strict=True):
                 st.append(_sx(second | top))
             else:
                 st.append(int(second == top))
+            continue
+        if tok in ("D", "d"):
+            # Side-effect only. Both write a flag at ctx+44 and ctx+56 and
+            # touch neither the stack pointers nor the depth, so they are
+            # transparent to the value -- `xDx=` is just `a == b` with a flag
+            # raised. Recorded for the caller, not returned in the result.
+            denial = (tok == "D")
+            continue
+        if tok == "MR":
+            memory_pushed = True
+            st.append(_sx(memory))          # read ctx+16, push like `x`
+            continue
+        if tok in ("M", "M+"):
+            if not st:
+                raise ValueError("stack underflow at %r in %r" % (tok, expr))
+            # Neither adjusts r9: the top is read, not popped.
+            memory = _sx(st[-1] if tok == "M" else memory + st[-1])
             continue
         if tok in ("<", ">", "<=", ">="):
             if len(st) < 2:
