@@ -566,7 +566,7 @@ RPN_HANDLERS = {
 
 #: Tokens whose behaviour has been read out of the handler machine code. Every
 #: other recognised character is deliberately unimplemented -- see `evaluate`.
-RPN_VERIFIED = frozenset("+-*^~&|x")
+RPN_VERIFIED = frozenset("+-*^~&|=x")
 
 
 def evaluate(expr, ops, strict=True):
@@ -578,35 +578,47 @@ def evaluate(expr, ops, strict=True):
     separate mechanism from `CRBDiagCalculate::calculate` and its 22 opcodes,
     which serve the dataflow-graph nodes. Do not mix the two.
 
-    **Subtraction is reversed from conventional RPN.** The `-` handler is::
+    **Which slot is the top matters, and is settled by the push handler**, not
+    by reading the binary operators. `x` stores the operand at ``r9+8`` and then
+    advances ``r9`` by 4, leaving it at ``@(4,r9)``; the shared epilogue writes
+    the result to ``@r9`` and then drops ``r9`` by 4, putting it at the new
+    ``@(4,r9)``. So::
 
-        mov.l @r9,r1       ; TOS
-        mov.l @(4,r9),r2   ; NEXT
-        sub   r2,r1        ; TOS - NEXT
+        @(4,r9)   top of stack
+        @r9       the element below it
 
-    so `a b -` yields `b - a`, not `a - b`. That is presumably why the opcode
-    set carries both `Sub` and `SubRev`. Getting this backwards produces
-    plausible numbers that are quietly wrong, which is the whole reason this
-    function was rewritten.
+    Subtraction is therefore **conventional**: the `-` handler loads ``@r9``
+    into r1 and ``@(4,r9)`` into r2 and computes ``sub r2,r1``, i.e.
+    ``second - top``, so `a b -` yields `a - b`.
+
+    An earlier revision of this function asserted the opposite, having inferred
+    the stack direction from the binary operators instead of the push. The
+    operands are symmetric there and the mistake is invisible in `+` and `*`;
+    it only shows up in `-`, where it silently negates every result.
 
     Implemented, each read from its handler:
 
-    ==========  ==========================  ============================
-    token       handler                     operation
-    ==========  ==========================  ============================
-    ``x``       ``0890640E``                push the next operand
-    ``+``       ``08906442``                ``add r2,r1``   TOS + NEXT
-    ``-``       ``08906474``                ``sub r2,r1``   TOS - NEXT
-    ``*``       ``08906458``                ``mul.l``       TOS * NEXT
-    ``^``       ``08906790``                ``xor r2,r1``
-    ``~``       ``089067C8``                ``not r1,r1``
-    ``&``       ``089064E8``                bitwise and
-    ``|``       ``08906550``                bitwise or
-    ==========  ==========================  ============================
+    ==========  ==============  ==========================================
+    token       handler         operation
+    ==========  ==============  ==========================================
+    ``x``       ``0890640E``    push the next operand
+    ``+``       ``08906442``    ``add r2,r1``     second + top
+    ``-``       ``08906474``    ``sub r2,r1``     second - top
+    ``*``       ``08906458``    ``mul.l``         second * top
+    ``^``       ``08906790``    ``xor r2,r1``
+    ``&``       ``089064E8``    bitwise and
+    ``|``       ``08906550``    bitwise or
+    ``~``       ``089067C8``    ``not`` on ``@(4,r9)``, in place -- unary
+    ``=``       ``089065DE``    ``cmp/eq`` then ``movt`` -- equality, 0 or 1
+    ==========  ==============  ==========================================
 
-    Everything else raises. `/` and `%` call helper routines whose operand
-    order has not been established; the comparison, memory, denial, rounding
-    and averaging tokens have handlers but their stack effects were not read.
+    Everything else raises. `/` and `%` call helper routines: in `/` the
+    **second** element is the one zero-checked, so it is the divisor and the
+    result looks like ``top / second`` -- reversed relative to subtraction --
+    but that has not been confirmed by reading the helper and is not
+    implemented on the strength of an inference. The comparison, memory,
+    denial, rounding and averaging tokens have handlers whose stack effects
+    were not read.
     A previous version guessed at all of these and claimed confirmation against
     "node 187", which turned out to be an artifact of a keying bug in
     :func:`operands` -- the expression at that ident is not what was assumed.
@@ -637,22 +649,25 @@ def evaluate(expr, ops, strict=True):
             st.append(_sx(ops[k]))
             k += 1
             continue
-        if tok in ("+", "-", "*", "^", "&", "|"):
+        if tok in ("+", "-", "*", "^", "&", "|", "="):
             if len(st) < 2:
                 raise ValueError("stack underflow at %r in %r" % (tok, expr))
-            tos, nxt = st.pop(), st.pop()
+            top = st.pop()
+            second = st.pop()
             if tok == "+":
-                st.append(_sx(tos + nxt))
+                st.append(_sx(second + top))
             elif tok == "-":
-                st.append(_sx(tos - nxt))       # TOS - NEXT, see docstring
+                st.append(_sx(second - top))    # second - top; see docstring
             elif tok == "*":
-                st.append(_sx(tos * nxt))
+                st.append(_sx(second * top))
             elif tok == "^":
-                st.append(_sx(tos ^ nxt))
+                st.append(_sx(second ^ top))
             elif tok == "&":
-                st.append(_sx(tos & nxt))
+                st.append(_sx(second & top))
+            elif tok == "|":
+                st.append(_sx(second | top))
             else:
-                st.append(_sx(tos | nxt))
+                st.append(int(second == top))
             continue
         if tok == "~":
             if not st:
