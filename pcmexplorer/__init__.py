@@ -1,6 +1,6 @@
 """PCM Explorer -- read-only browser for Porsche PCM / Audi MMI disk images."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 def build_id():
@@ -18,6 +18,6 @@ def build_id():
 
 
 def version_string():
-    """'0.2.0' from source, '0.2.0 (build 1a2b3c4)' for a CI build."""
+    """'0.3.0' from source, '0.3.0 (build 1a2b3c4)' for a CI build."""
     b = build_id()
     return "%s (build %s)" % (__version__, b) if b else __version__
