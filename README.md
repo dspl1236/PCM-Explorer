@@ -12,6 +12,8 @@ drive, you get a 40 GB file that nothing will open.
 This opens it — and, as it turned out, everything else the unit is made of: the firmware
 images, the update discs, the persistence flash, and the interface itself.
 
+**➜ [Download PCM-Explorer.exe for Windows](https://github.com/dspl1236/PCM-Explorer/releases/download/latest/PCM-Explorer.exe)** — a standalone build, no Python needed. That link always serves the current build of `main`; it's unsigned, so verify against its [SHA256](https://github.com/dspl1236/PCM-Explorer/releases/download/latest/PCM-Explorer.exe.sha256) if you like. Prefer source, a pinned version, or another OS? See [Install](#install).
+
 ```
 python explorer.py                                    # desktop UI
 python explorer.py disk.img                           # summary -- what IS this image?
