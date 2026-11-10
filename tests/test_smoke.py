@@ -735,6 +735,42 @@ def test_nor():
               n.region("HBPERSISTENCE").unit and not n.region("IFS2").unit)
         s = nor.summarise_nor(n)
         check("summary names the layout", "16-bit interleave" in s)
+
+        # the CLI over the same files
+        import contextlib
+        import io
+        from pcmexplorer.cli import main as cli_main
+
+        def run(*argv):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cli_main(list(argv))
+            return rc, out.getvalue()
+
+        rc, out = run(pm)
+        check("cli: a merged dump is recognised and checked",
+              rc == 0 and "IFS2" in out and "intact" in out, "rc %s" % rc)
+        rc, out = run("nor", pa, pb)
+        check("cli: nor <chipA> <chipB> finds the layout",
+              rc == 0 and "16-bit interleave" in out, "rc %s" % rc)
+        rc, out = run(pm, "regions")
+        check("cli: regions lists the map unchecked",
+              rc == 0 and "HBPERSISTENCE" in out and " OK " not in out)
+        dest = os.path.join(tmp, "ifs2.out")
+        rc, out = run(pm, "save", "IFS2", dest)
+        used = 0x40 + struct.unpack_from("<I", img, 0xFC0000 + 12)[0]
+        check("cli: save writes just the region's image",
+              rc == 0 and open(dest, "rb").read() == bytes(img[0xFC0000:0xFC0000 + used]))
+        rc, out = run(pm, "ls", "IPL")
+        check("cli: a raw region says to use save", rc == 1 and "save IPL" in out)
+        rc, out = run(pa)
+        check("cli: one chip alone points at the nor verb", "pcm-explorer nor" in out)
+        with open(pm, "r+b") as f:                             # break IFS2 on disk
+            f.seek(0xFC0000 + 0x40)
+            f.write(b"\x00")
+        rc, out = run(pm, "check")
+        check("cli: check exits 2 on a BAD region", rc == 2 and "BAD: IFS2" in out,
+              "rc %s" % rc)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
