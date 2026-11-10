@@ -30,6 +30,9 @@ python explorer.py update.iso units                   # which head units accept 
 python explorer.py update.iso crc                     # verify every payload
 
 python explorer.py PCM3_HBpersistence.efs             # factory persistence flash
+
+python explorer.py nor chipA.bin chipB.bin            # a NOR dump: which regions are bad
+python explorer.py nor.bin check "D:/PCM/ISO Extract" # ...and what on a disc each one is
 python explorer.py moccaV2Target.mmi                  # the HMI itself
 python explorer.py moccaV2Target.mmi langs            # every string, every language
 python explorer.py moccaV2Target.mmi screens 33616    # a screen's elements, x/y/w/h
@@ -235,6 +238,22 @@ UI, **Open NOR chips...** takes both chip files (or **Open image...** takes a me
   CRC records and its payloads — which also covers the bootloader and FPGA.
 - **IFS1, IFS2 and the persistence regions browse** like the `.ifs` / `.efs` files they
   are; **Save region...** writes one region (or the merged image) to a new file.
+
+The same from the command line, on a merged dump or straight from the two chips:
+
+```
+python explorer.py nor chipA.bin chipB.bin              # check every region
+python explorer.py nor.bin check "D:/PCM/ISO Extract"   # ...and match each to a disc
+python explorer.py nor.bin regions                      # the flash map, unchecked
+python explorer.py nor.bin ls IFS2 /HBbin               # files inside a region
+python explorer.py nor.bin cat HBPERSISTENCE /96xx.txt
+python explorer.py nor.bin extract IFS1 /proc/boot/procnto-instr procnto
+python explorer.py nor.bin save IFS2 ifs2.bin           # one region's image (or: all)
+python explorer.py nor chipA.bin chipB.bin save all nor.bin
+```
+
+`check` exits 2 when a region is BAD. A merged dump made by PCM-Forge's `nor_repair.py`
+keeps its `.layout.json` alongside, and damage is then still named by chip and offset.
 
 It stays read-only. Repairing a dump — splicing a good region in and splitting the
 result back into chip files — is PCM-Forge's `tools/nor_repair.py`. The persistence

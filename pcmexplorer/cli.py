@@ -1,4 +1,5 @@
 """Command-line interface -- everything the GUI does, scriptable."""
+import json
 import os
 import re
 import sys
@@ -12,6 +13,8 @@ from .firmware import FirmwareImage, looks_like_ifs
 from .efs import EfsImage, looks_like_efs, summarise_efs
 from .hbm5 import Hbm5File, looks_like_hbm5, summarise_hbm5
 from .updatedisc import UpdateDisc, looks_like_update_disc, summarise_update
+from .nor import (NorImage, PROBES_EXPECTED, describe_layout, looks_like_nor,
+                  looks_like_nor_chip, summarise_nor)
 
 USAGE = """PCM Explorer -- browse a Porsche PCM / Audi MMI hard-drive image.
 
@@ -49,6 +52,18 @@ HMI definitions (.mmi) hold the screens and every string the unit can display:
   pcm-explorer <x.mmi> screens [root]       drawables resolved to x/y/w/h
   pcm-explorer <x.mmi> svg <root> [out]     a screen as SVG, to design against
 
+NOR flash dumps -- the PCM 3.1's two flash chips read with a programmer, as one
+merged 64 MB image, or the two chip files with `nor`:
+
+  pcm-explorer <dump.bin>                   every region checked: OK / BAD, and where
+  pcm-explorer <dump.bin> check [disc]      ...and each region matched to an update disc
+  pcm-explorer <dump.bin> regions           the flash map, without checking (instant)
+  pcm-explorer <dump.bin> ls <region> [path]        files in IFS1/IFS2/EMERGENCY/HBPERSISTENCE
+  pcm-explorer <dump.bin> cat <region> <path>
+  pcm-explorer <dump.bin> extract <region> <path> <dest>
+  pcm-explorer <dump.bin> save <region|all> <dest>  one region's bytes, or the merged image
+  pcm-explorer nor <chipA> <chipB> [command ...]    the same, straight from the two chips
+
 Search contents across any of the above:
 
   pcm-explorer grep <target> <pattern> [part]   which files contain this?
@@ -75,7 +90,7 @@ Compare any two of the above:
   pcm-explorer diff ./car_hbp PCM3_HBpersistence.efs    a car vs the factory
 
 Accepts a raw disk image, a firmware image (PCM3_IFS1.ifs / PCM3_IFS2.ifs),
-or a PCM 3.1 update disc.
+a PCM 3.1 update disc, or a PCM 3.1 NOR flash dump.
 
 <part> is P1/P2/P3.  <offset> accepts 0x hex.  Everything is opened read-only.
 """
@@ -103,6 +118,145 @@ def _fw_find(fw, path):
         if pth == want:
             return pth, e
     return None, None
+
+
+def _fw_cmd(fw, cmd, a):
+    """summary / ls / cat / extract / verify on a FirmwareImage or EfsImage --
+    a .ifs / .efs file, or a region of a NOR dump."""
+    if isinstance(fw, EfsImage) and cmd in ("parts", "summary"):
+        print(summarise_efs(fw))
+        return 0
+    if cmd in ("parts", "summary"):
+        print(summarise_firmware(fw))
+    elif cmd == "ls":
+        return _fw_ls(fw, a[0] if a else None)
+    elif cmd == "cat":
+        if not a:
+            print("usage: cat <path>")
+            return 1
+        pth, e = _fw_find(fw, a[0])
+        if not e:
+            print("not found: %s" % a[0])
+            return 1
+        data = fw.read_file(e)
+        txt = preview(pth, data)
+        if txt is not None:
+            print(txt)
+        else:
+            sys.stdout.buffer.write(data)
+    elif cmd == "extract":
+        if len(a) < 2:
+            print("usage: extract <path> <dest>")
+            return 1
+        pth, e = _fw_find(fw, a[0])
+        if not e:
+            print("not found: %s" % a[0])
+            return 1
+        with open(a[1], "wb") as fh:
+            fh.write(fw.read_file(e))
+        print("  wrote %s (%s)" % (a[1], human(e["size"])))
+    elif cmd == "verify":
+        allok = True
+        for n, ok, det in fw.verify():
+            allok &= ok
+            print("  [%s] %-18s %s" % ("PASS" if ok else "FAIL", n, det))
+        return 0 if allok else 2
+    else:
+        print(USAGE)
+        return 1
+    return 0
+
+
+def _nor_open(path):
+    """A merged dump; nor_repair.py's <dump>.layout.json, when present, says how
+    it was assembled from the chips, so damage can still be named by chip."""
+    layout = None
+    side = path + ".layout.json"
+    if os.path.exists(side):
+        try:
+            with open(side) as f:
+                layout = tuple(json.load(f)["layout"])
+        except Exception:
+            layout = None
+    return NorImage(path, layout=layout)
+
+
+def _nor_cmd(img, cmd, a):
+    if cmd in ("summary", "check"):
+        matches = None
+        if cmd == "check" and a:
+            try:
+                disc = UpdateDisc(a[0])
+            except Exception as e:
+                print("not a readable update disc: %s" % e)
+                return 1
+            try:
+                print("matching regions against %s ..." % a[0])
+                matches = img.match_disc(disc)
+            finally:
+                disc.close()
+        img.check_all()
+        print(summarise_nor(img, matches))
+        return 2 if any(r.status == "BAD" for r in img.regions) else 0
+    if cmd == "regions":
+        print(summarise_nor(img))
+        return 0
+    names = ", ".join(r.name for r in img.regions)
+    if cmd == "save":
+        if len(a) < 2:
+            print("usage: save <region|all> <dest>   regions: %s" % names)
+            return 1
+        if a[0].lower() in ("all", "merged"):
+            data = img.data
+        else:
+            r = img.region(a[0])
+            if r is None:
+                print("no such region: %s   (one of %s, or all)" % (a[0], names))
+                return 1
+            img.check(r)                       # sets r.used: the image, not the slack
+            data = img.region_bytes(r)[:r.used or r.size]
+        with open(a[1], "wb") as fh:
+            fh.write(data)
+        print("  wrote %s (%s)" % (a[1], human(len(data))))
+        return 0
+    if cmd in ("ls", "cat", "extract"):
+        if not a:
+            print("usage: %s <region> ...   regions: %s" % (cmd, names))
+            return 1
+        r = img.region(a[0])
+        if r is None:
+            print("no such region: %s   (one of %s)" % (a[0], names))
+            return 1
+        try:
+            fw = img.open_region(r)
+        except Exception as e:
+            print("%s does not open: %s" % (r.name, e))
+            return 1
+        if fw is None:
+            print("%s holds no files (%s) -- use: save %s <dest>"
+                  % (r.name, r.description, r.name))
+            return 1
+        return _fw_cmd(fw, cmd, a[1:])
+    print(USAGE)
+    return 1
+
+
+def cmd_nor(argv):
+    """pcm-explorer nor <chipA> <chipB> [command ...]"""
+    if len(argv) < 2:
+        print("usage: pcm-explorer nor <chipA> <chipB> [summary|check [disc]|regions|"
+              "ls|cat|extract|save ...]")
+        return 1
+    try:
+        img = NorImage.from_chips(argv[0], argv[1])
+    except (OSError, ValueError) as e:
+        print("cannot open the chip pair: %s" % e)
+        return 1
+    print("chips: %s -- %d of %d region headers in place"
+          % (describe_layout(img.layout), img.layout_score, PROBES_EXPECTED))
+    if len(img.layout_ties) > 1:
+        print("WARNING: %d layouts fit equally well" % len(img.layout_ties))
+    return _nor_cmd(img, argv[2] if len(argv) > 2 else "summary", argv[3:])
 
 
 def _fs_or_die(img, pname):
@@ -712,6 +866,8 @@ def main(argv):
         return cmd_report(argv[1:])
     if argv[0] == "timeline":
         return cmd_timeline(argv[1:])
+    if argv[0] == "nor":
+        return cmd_nor(argv[1:])
 
     path = argv[0]
     # a directory is only meaningful as an extracted update-disc tree
@@ -750,6 +906,15 @@ def main(argv):
         print("not a file: %s" % path)
         return 1
 
+    # A NOR flash dump before the firmware probe: a merged dump is just a .bin.
+    if looks_like_nor(path):
+        try:
+            img = _nor_open(path)
+        except Exception as e:
+            print("not a readable NOR dump: %s" % e)
+            return 1
+        return _nor_cmd(img, cmd, argv[2:])
+
     # A firmware image or an EFS persistence image is a different container but
     # browses the same way -- same entry shape, so one code path serves both.
     if looks_like_ifs(path) or looks_like_efs(path):
@@ -758,55 +923,16 @@ def main(argv):
         except Exception as e:
             print("not a readable firmware image: %s" % e)
             return 1
-        if isinstance(fw, EfsImage) and cmd in ("parts", "summary"):
-            print(summarise_efs(fw))
-            return 0
-        a = argv[2:]
-        if cmd in ("parts", "summary"):
-            print(summarise_firmware(fw))
-        elif cmd == "ls":
-            return _fw_ls(fw, a[0] if a else None)
-        elif cmd == "cat":
-            if not a:
-                print("usage: cat <path>")
-                return 1
-            pth, e = _fw_find(fw, a[0])
-            if not e:
-                print("not found: %s" % a[0])
-                return 1
-            data = fw.read_file(e)
-            txt = preview(pth, data)
-            if txt is not None:
-                print(txt)
-            else:
-                sys.stdout.buffer.write(data)
-        elif cmd == "extract":
-            if len(a) < 2:
-                print("usage: extract <path> <dest>")
-                return 1
-            pth, e = _fw_find(fw, a[0])
-            if not e:
-                print("not found: %s" % a[0])
-                return 1
-            with open(a[1], "wb") as fh:
-                fh.write(fw.read_file(e))
-            print("  wrote %s (%s)" % (a[1], human(e["size"])))
-        elif cmd == "verify":
-            allok = True
-            for n, ok, det in fw.verify():
-                allok &= ok
-                print("  [%s] %-18s %s" % ("PASS" if ok else "FAIL", n, det))
-            return 0 if allok else 2
-        else:
-            print(USAGE)
-            return 1
-        return 0
+        return _fw_cmd(fw, cmd, argv[2:])
 
     img = DiskImage(path)
     try:
         print("%s  (%s)" % (os.path.basename(path), human(img.size)))
         if not img.parts:
             print("  no MBR partition table found")
+            if looks_like_nor_chip(path):
+                print("  32 MB is the size of one PCM 3.1 NOR flash chip -- open it with\n"
+                      "  its partner:  pcm-explorer nor <chipA> <chipB>")
             return 1
         a = argv[2:]
         if cmd == "summary":
