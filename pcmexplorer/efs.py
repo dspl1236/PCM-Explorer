@@ -68,10 +68,14 @@ class EfsImage(object):
     ERASE_RUN = 64            # trailing 0xFF run treated as erase slack, not data
     ALIGN = 4                 # extents are 4-byte aligned, padded with 0xFF
 
-    def __init__(self, path):
+    def __init__(self, path, data=None):
+        """Open a .efs file, or -- with ``data`` -- an image already in memory
+        (a region of a NOR flash dump); ``path`` is then just its label."""
         self.path = path
-        with open(path, "rb") as f:
-            self.data = f.read()
+        if data is None:
+            with open(path, "rb") as f:
+                data = f.read()
+        self.data = bytes(data)
         if F3S_MAGIC not in self.data[:MAGIC_WINDOW]:
             raise ValueError("not a QNX F3S image (no %s header)"
                              % F3S_MAGIC.decode())

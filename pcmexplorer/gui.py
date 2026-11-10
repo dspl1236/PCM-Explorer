@@ -14,6 +14,8 @@ from .firmware import FirmwareImage, looks_like_ifs
 from .efs import EfsImage, looks_like_efs, summarise_efs
 from .hbm5 import Hbm5File, looks_like_hbm5, summarise_hbm5
 from .updatedisc import UpdateDisc, looks_like_update_disc, summarise_update
+from .nor import (NorImage, compact_matches, looks_like_nor, looks_like_nor_chip,
+                  summarise_nor)
 
 # Palette shared with PCM-Forge (docs/index.html :root), so the desktop tool and
 # the web toolkit read as one project.
@@ -24,6 +26,7 @@ ACCENT2, GREEN, RED = "#e8c85e", "#4eca7a", "#e85454"
 
 OPEN_TYPES = [("Head-unit images", "*.img *.dd *.raw *.bin *.ifs *.iso *.efs *.mmi"),
               ("Disk images", "*.img *.dd *.raw *.bin"),
+              ("NOR flash dumps", "*.bin *.img *.raw"),
               ("Firmware images", "*.ifs"),
               ("Update discs", "*.iso"),
               ("Persistence images", "*.efs"),
@@ -49,6 +52,8 @@ class Explorer(tk.Tk):
         self.fw = None            # FirmwareImage when a .ifs is open
         self.disc = None          # UpdateDisc when an .iso / disc folder is open
         self.hmi = None           # Hbm5File when a .mmi is open
+        self.nor = None           # NorImage when a NOR flash dump is open
+        self.nor_matches = None   # {region: [disc matches]} after "Match disc..."
         self.fs = None            # QNX6FS/QNX4FS when the partition mounts
         self.nodes = {}           # tree item id -> inode dict
         self.salvage = {}         # fallback directory map
@@ -59,7 +64,9 @@ class Explorer(tk.Tk):
         self._build()
         self._wheel()
         if initial:
-            self.load(initial)
+            # from inside the event loop: loading may start worker threads, and
+            # Tk refuses after() calls from them until mainloop is running
+            self.after(50, self.load, initial)
 
     def show_screen(self, root=None):
         """Draw an HMI screen's element boxes on an 800x480 canvas.
@@ -248,6 +255,8 @@ class Explorer(tk.Tk):
         ttk.Button(top, text="Open image...", command=self.open_image).pack(side="left")
         ttk.Button(top, text="Open folder...", command=self.open_folder).pack(side="left",
                                                                              padx=(6, 0))
+        ttk.Button(top, text="Open NOR chips...", command=self.open_chips).pack(side="left",
+                                                                               padx=(6, 0))
         self.lbl = ttk.Label(top, text="(no image loaded)", style="Dim.TLabel")
         self.lbl.pack(side="left", padx=12)
         # Version in the corner: the first thing to ask when someone reports a bug.
@@ -263,12 +272,10 @@ class Explorer(tk.Tk):
             lambda b: ttk.Treeview(b, columns=("type", "size", "fs"),
                                    show="tree headings", height=6),
             fill="x")
-        self.plist.heading("#0", text="part")
-        self.plist.column("#0", width=55)
-        for c, w in (("type", 80), ("size", 85), ("fs", 165)):
-            self.plist.heading(c, text=c)
-            self.plist.column(c, width=w)
+        self._plist_headings(("part", "type", "size", "fs"), 55, 6)
         self.plist.bind("<<TreeviewSelect>>", self.on_part)
+        self.plist.tag_configure("OK", foreground=GREEN)
+        self.plist.tag_configure("BAD", foreground=RED)
 
         ttk.Label(left, text="Files", style="Title.TLabel").pack(anchor="w", pady=(10, 0))
         self.tree = self._scrolled(
@@ -299,6 +306,9 @@ class Explorer(tk.Tk):
         ttk.Button(bar, text="Verify", command=self.verify).pack(side="left", padx=6)
         ttk.Button(bar, text="Summary", command=self.show_summary).pack(side="left")
         ttk.Button(bar, text="View screen", command=self.show_screen).pack(side="left", padx=6)
+        ttk.Button(bar, text="Match disc...", command=self.match_disc).pack(side="left")
+        ttk.Button(bar, text="Save region...", command=self.save_region).pack(side="left",
+                                                                              padx=6)
         ttk.Label(right, text="Content", style="Title.TLabel").pack(anchor="w")
         # wrap="none" so a hex dump keeps its columns -- hence a horizontal bar
         self.hexv = self._scrolled(
@@ -311,6 +321,16 @@ class Explorer(tk.Tk):
         self.status = tk.StringVar(value="Read-only — the image is never modified.")
         tk.Label(self, textvariable=self.status, bg=PANEL2, fg=DIM, anchor="w",
                  padx=8, pady=4).pack(fill="x", side="bottom")
+
+    def _plist_headings(self, names, first_w, rows):
+        """The left list shows partitions, release definitions or NOR regions;
+        its headings and height follow whichever is open."""
+        self.plist.heading("#0", text=names[0])
+        self.plist.column("#0", width=first_w)
+        for c, txt, w in zip(("type", "size", "fs"), names[1:], (80, 85, 165)):
+            self.plist.heading(c, text=txt)
+            self.plist.column(c, width=w)
+        self.plist.configure(height=rows)
 
     def set_status(self, s):
         self.status.set(s)
@@ -473,9 +493,199 @@ class Explorer(tk.Tk):
         self.set_status("HMI definition - %d strings, %d translated keys. Read-only."
                         % (len(strs), len(rows)))
 
+    # -- NOR flash dumps --
+    def open_chips(self):
+        """The PCM 3.1's two flash chips, as dumped by a programmer."""
+        ps = filedialog.askopenfilenames(title="Pick BOTH NOR chip dumps (32 MB each)",
+                                         filetypes=OPEN_TYPES)
+        if not ps:
+            return
+        if len(ps) != 2:
+            messagebox.showinfo("Two chips",
+                                "Select both chip dumps together (Ctrl-click the "
+                                "second).\n\nA merged 64 MB dump opens with "
+                                "\"Open image...\" instead.")
+            return
+        self._open_chip_pair(ps[0], ps[1])
+
+    def _open_chip_pair(self, a, b):
+        self.set_status("Working out how the two chips are wired...")
+        try:
+            nor = NorImage.from_chips(a, b)
+        except Exception as e:
+            messagebox.showerror("Could not open NOR chips", str(e))
+            self.set_status("Could not open the chip pair.")
+            return
+        self._load_nor(nor)
+
+    def _load_nor(self, nor):
+        if self.img:
+            self.img.close()
+        self.img, self.fw, self.fs, self.disc, self.hmi = None, None, None, None, None
+        self.nor, self.nor_matches = nor, None
+        self.lbl.config(text="%s   %s" % (os.path.basename(str(nor.path)), nor.describe()))
+        self.plist.delete(*self.plist.get_children())
+        self._plist_headings(("region", "address", "size", "check"), 120, len(nor.regions))
+        for r in nor.regions:
+            self.plist.insert("", "end", iid=r.name, text=r.name,
+                              values=("0x%07X" % r.start, human(r.size), "checking..."))
+        self.tree.delete(*self.tree.get_children())
+        self.nodes = {}
+        self.hexv.delete("1.0", "end")
+        self.info.delete("1.0", "end")
+        self.info.insert("end", summarise_nor(nor))
+        self.set_status("NOR flash - checking every region (IFS2 takes a few seconds)...")
+        threading.Thread(target=self._nor_check_worker, args=(nor,), daemon=True).start()
+
+    def _nor_row(self, r):
+        if self.nor is None or not self.plist.exists(r.name):
+            return
+        self.plist.item(r.name, values=("0x%07X" % r.start, human(r.size),
+                                        r.status or "checking..."),
+                        tags=(r.status,) if r.status in ("OK", "BAD") else ())
+
+    def _nor_check_worker(self, nor):
+        for r in nor.regions:
+            try:
+                nor.check(r)
+            except Exception as e:
+                r.status, r.detail = "BAD", "check failed: %s" % e
+            self.after(0, self._nor_row, r)
+        bad = [r.name for r in nor.regions if r.status == "BAD"]
+
+        def done():
+            if self.nor is not nor:
+                return
+            if not self.plist.selection():
+                self.info.delete("1.0", "end")
+                self.info.insert("end", summarise_nor(nor, self.nor_matches))
+            self.set_status("NOR flash - %s. Read-only."
+                            % ("BAD: " + ", ".join(bad) if bad else
+                               "every region that can check itself is intact"))
+        self.after(0, done)
+
+    def _show_region(self, name):
+        nor = self.nor
+        r = nor.region(name)
+        if r is None:
+            return
+        self.info.delete("1.0", "end")
+        self.hexv.delete("1.0", "end")
+        self.info.insert("end", "%s   %s\n" % (r.name, r.description))
+        self.info.insert("end", "flash  0x%07X - 0x%07X   %s\n"
+                         % (r.start, r.end, human(r.size)))
+        if r.used:
+            self.info.insert("end", "image  %s used\n" % human(r.used))
+        self.info.insert("end", "check  %s  %s\n" % (r.status or "(running)", r.detail))
+        if nor.layout is not None:
+            self.info.insert("end", "chips  starts at %s\n" % nor.locate(r.start))
+        if self.nor_matches is not None:
+            m = self.nor_matches.get(r.name)
+            self.info.insert("end", "disc   %s\n" % (compact_matches(m) if m else "no match"))
+        if r.unit:
+            self.info.insert("end", "\nThis region belongs to THIS unit (VIN, activation, "
+                                    "coding).\nNever replace it with another unit's.\n")
+        self.hexv.insert("end", hexdump(nor.data[r.start:r.start + 512], r.start))
+        self.tree.delete(*self.tree.get_children())
+        self.nodes, self.fw = {}, None
+        if r.kind in ("ifs1", "ifs2", "efs") and r.status != "ERASED":
+            self.set_status("%s - opening its files..." % r.name)
+            threading.Thread(target=self._open_region_worker, args=(nor, r),
+                             daemon=True).start()
+
+    def _open_region_worker(self, nor, r):
+        err = None
+        try:
+            fw = nor.open_region(r)
+        except Exception as e:
+            fw, err = None, str(e)
+
+        def show():
+            if self.nor is not nor:
+                return
+            sel = self.plist.selection()
+            if not sel or sel[0] != r.name:
+                return                      # the user has moved on
+            if fw is None:
+                self.set_status("%s - no files to browse%s"
+                                % (r.name, (": " + err) if err else "."))
+                return
+            self.fw = fw
+            self._fill_firmware(fw)
+            self.set_status("%s - %d entries%s. Read-only."
+                            % (r.name, len(fw.entries()),
+                               " (region is BAD: some files may be corrupt)"
+                               if r.status == "BAD" else ""))
+        self.after(0, show)
+
+    def match_disc(self):
+        """Which update-disc payload each region equals, by CRC-32."""
+        if not self.nor:
+            messagebox.showinfo("Match disc", "Open a NOR flash dump first.")
+            return
+        p = filedialog.askopenfilename(
+            title="Update disc: an .ISO, or any file in an extracted disc folder",
+            filetypes=[("Update discs", "*.iso *.ISO *.def *.DEF *.disc"),
+                       ("All files", "*.*")])
+        if not p:
+            return
+        if not p.lower().endswith(".iso"):
+            p = os.path.dirname(p)
+        nor = self.nor
+        self.set_status("Matching regions against %s..." % os.path.basename(p))
+        threading.Thread(target=self._match_worker, args=(nor, p), daemon=True).start()
+
+    def _match_worker(self, nor, path):
+        try:
+            disc = UpdateDisc(path)
+            try:
+                m = nor.match_disc(disc, progress=lambda i, n, fn: self.set_status(
+                    "Hashing disc payloads %d/%d  %s" % (i + 1, n, fn)))
+            finally:
+                disc.close()
+        except Exception as e:
+            msg = str(e)
+            self.after(0, lambda: messagebox.showerror("Could not read that disc", msg))
+            return
+
+        def done():
+            if self.nor is not nor:
+                return
+            self.nor_matches = m
+            self.plist.selection_remove(self.plist.selection())
+            self.hexv.delete("1.0", "end")
+            self.info.delete("1.0", "end")
+            self.info.insert("end", summarise_nor(nor, m))
+            hit = sum(1 for v in m.values() if v)
+            self.set_status("%d of %d regions match something on the disc."
+                            % (hit, len(nor.regions)))
+        self.after(0, done)
+
+    def save_region(self):
+        """Write the selected region -- or, with none selected, the whole merged
+        image -- to a new file. The dump itself is never modified."""
+        if not self.nor:
+            messagebox.showinfo("Save region", "Open a NOR flash dump first.")
+            return
+        sel = self.plist.selection()
+        r = self.nor.region(sel[0]) if sel else None
+        if r is None:
+            data, name = self.nor.data, "nor_merged.bin"
+        else:
+            data = self.nor.region_bytes(r)[:r.used or r.size]
+            name = "%s_0x%07X.bin" % (r.name, r.start)
+        dest = filedialog.asksaveasfilename(initialfile=name, defaultextension=".bin")
+        if not dest:
+            return
+        with open(dest, "wb") as fh:
+            fh.write(data)
+        self.set_status("Wrote %s (%s)" % (dest, human(len(data))))
+
     def load(self, path):
         # An update disc -- ISO or extracted folder -- before the disk-image path,
         # since an ISO would otherwise be probed for an MBR it does not have.
+        self.nor, self.nor_matches = None, None
+        self._plist_headings(("part", "type", "size", "fs"), 55, 6)
         if looks_like_update_disc(path):
             self._load_disc(path)
             return
@@ -496,6 +706,25 @@ class Explorer(tk.Tk):
         if looks_like_hbm5(path):
             self._load_hmi(path)
             return
+        # A NOR dump before the firmware probe: a merged dump is just a .bin,
+        # and one chip on its own is a 32 MB file that needs its partner.
+        if looks_like_nor(path):
+            try:
+                self._load_nor(NorImage(path))
+            except Exception as e:
+                messagebox.showerror("Could not open NOR dump", str(e))
+            return
+        if looks_like_nor_chip(path) and not (looks_like_ifs(path) or looks_like_efs(path)):
+            if messagebox.askyesno(
+                    "One NOR chip?",
+                    "%s is 32 MB -- the size of one of the PCM 3.1's two flash "
+                    "chips.\n\nPick the other chip's dump to open them together?"
+                    % os.path.basename(path)):
+                other = filedialog.askopenfilename(title="The other NOR chip",
+                                                   filetypes=OPEN_TYPES)
+                if other:
+                    self._open_chip_pair(path, other)
+                return
         # Firmware (.ifs) and persistence (.efs) are different containers that
         # browse the same way -- same entry shape, so one branch serves both.
         if looks_like_ifs(path) or looks_like_efs(path):
@@ -543,7 +772,9 @@ class Explorer(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.nodes = {}
         folders = {"": ""}
-        for pth, ent in sorted(fw.entries()):
+        # by path only: an EFS can list one path twice (HBpersistence has two
+        # /config entries), and the tie would then compare the entry dicts
+        for pth, ent in sorted(fw.entries(), key=lambda pe: pe[0]):
             parts = [x for x in pth.split("/") if x]
             if not parts:
                 continue
@@ -563,7 +794,9 @@ class Explorer(tk.Tk):
         """Answer 'what is this image?' rather than just listing files."""
         self.info.delete("1.0", "end")
         try:
-            if self.hmi:
+            if self.nor:
+                self.info.insert("end", summarise_nor(self.nor, self.nor_matches))
+            elif self.hmi:
                 self.info.insert("end", summarise_hbm5(self.hmi))
             elif self.disc:
                 self.info.insert("end", summarise_update(self.disc))
@@ -580,6 +813,9 @@ class Explorer(tk.Tk):
     def on_part(self, _evt=None):
         sel = self.plist.selection()
         if not sel:
+            return
+        if self.nor is not None:
+            self._show_region(sel[0])
             return
         if self.disc is not None:
             self._show_definition(sel[0])
@@ -877,12 +1113,22 @@ class Explorer(tk.Tk):
 
         walk("", 0)
         with open(dest, "w", encoding="utf-8") as fh:
-            fh.write("# %s  %s\n" % (os.path.basename(self.img.path),
+            src = self.img or self.fw or self.nor
+            fh.write("# %s  %s\n" % (os.path.basename(str(src.path)) if src else "",
                                      self.cur_part["name"] if self.cur_part else ""))
             fh.write("\n".join(lines))
         self.set_status("Wrote %s (%d lines)" % (dest, len(lines)))
 
     def verify(self):
+        if self.nor:
+            nor = self.nor
+            self.set_status("Re-checking every region...")
+            for r in nor.regions:
+                r.status = None
+                self._nor_row(r)
+            threading.Thread(target=self._nor_verify_worker, args=(nor,),
+                             daemon=True).start()
+            return
         if self.fw:
             res = self.fw.verify()
             txt = "\n".join("[%s] %-18s %s" % ("PASS" if ok else "FAIL", n, d)
@@ -894,6 +1140,15 @@ class Explorer(tk.Tk):
             return
         self.set_status("Verifying...")
         threading.Thread(target=self._verify_worker, daemon=True).start()
+
+    def _nor_verify_worker(self, nor):
+        self._nor_check_worker(nor)
+        txt = "\n".join("[%-10s] %-14s %s" % (r.status, r.name, r.detail)
+                        for r in nor.regions)
+        bad = any(r.status == "BAD" for r in nor.regions)
+        self.after(0, lambda: messagebox.showinfo(
+            "NOR flash verification", txt + ("\n\nSome regions are BAD." if bad else
+                                             "\n\nNo region failed its check.")))
 
     def _verify_worker(self):
         try:

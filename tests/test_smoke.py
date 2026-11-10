@@ -645,6 +645,100 @@ def _parses_xml(s):
         return False
 
 
+def _qnx_fix(buf):
+    """Set the last word so the little-endian u32 sum of buf is 0 (QNX rule)."""
+    from pcmexplorer.nor import wordsum
+    buf[-4:] = b"\0\0\0\0"
+    buf[-4:] = struct.pack("<I", (-wordsum(bytes(buf))) & 0xFFFFFFFF)
+    return buf
+
+
+def make_nor_image():
+    """A 64 MB flash with tiny but self-consistent regions at the real addresses."""
+    from pcmexplorer import nor
+    img = bytearray(b"\xff" * nor.FULL_SIZE)
+    img[0:16] = bytes(range(16))                               # IPL: anything
+    img[0x100000:0x100008] = b".HDG\x10\0\0\0"                 # FPGA
+    for at in (0x1C0000, 0xBC0000):                            # IFS1 / emergency
+        boot = bytearray(0x200)
+        boot[0:4] = nor.QNX_STARTUP
+        struct.pack_into("<II", boot, 0x20, 0x100, len(boot))
+        boot[0x100:0x110] = b"startup and fs.."
+        img[at:at + len(boot)] = _qnx_fix(boot)
+    fs = bytearray(64)                                         # IFS2: imagefs...
+    fs[0:7] = b"imagefs"
+    struct.pack_into("<I", fs, 8, len(fs))
+    fs = _qnx_fix(fs)
+    lzo = bytes([17 + len(fs)]) + bytes(fs) + b"\x11\x00\x00"  # ...as LZO literals
+    hdr = bytearray(0x40)
+    hdr[0:8] = nor.HBCIFS
+    struct.pack_into("<II", hdr, 8, len(fs), len(lzo))
+    img[0xFC0000:0xFC0000 + 0x40 + len(lzo)] = bytes(hdr) + lzo
+    for at in (0x3000000, 0x3F00000):                          # EFS regions
+        img[at:at + 4] = nor.EFS_HEAD
+    return img
+
+
+def test_nor():
+    print("\nNOR flash dumps")
+    from pcmexplorer import nor
+    img = make_nor_image()
+    for lay in nor.candidate_layouts():
+        a, b = nor.separate(bytes(img), lay)
+        if nor.combine([a, b], lay) != bytes(img):
+            check("layout %s round-trips" % (lay,), False)
+            break
+    else:
+        check("every chip layout round-trips", True)
+
+    lay = ("interleave", 2, 1, True)          # an awkward one on purpose
+    a, b = nor.separate(bytes(img), lay)
+    tmp = tempfile.mkdtemp(prefix="pcmx_nor")
+    try:
+        pa, pb, pm = (os.path.join(tmp, n) for n in ("a.bin", "b.bin", "merged.bin"))
+        for p, d in ((pa, a), (pb, b), (pm, bytes(img))):
+            with open(p, "wb") as f:
+                f.write(d)
+        check("looks_like_nor() accepts a merged dump", nor.looks_like_nor(pm))
+        check("looks_like_nor() rejects one chip", not nor.looks_like_nor(pa))
+        check("looks_like_nor_chip() accepts 32 MB", nor.looks_like_nor_chip(pa))
+
+        n = nor.NorImage.from_chips(pa, pb)
+        check("chip layout detected", n.layout == lay, nor.describe_layout(n.layout))
+        check("layout unambiguous", len(n.layout_ties) == 1, str(n.layout_ties))
+        st = {r.name: n.check(r).status for r in n.regions}
+        want = {"IPL": "UNVERIFIED", "FPGA": "UNVERIFIED", "IFS1": "OK",
+                "EMERGENCY": "OK", "IFS2": "OK", "HBPERSISTENCE": "UNVERIFIED",
+                "UPDATEHISTORY": "UNVERIFIED"}
+        check("clean dump: every region as expected", st == want, str(st))
+
+        bad = bytearray(img)
+        bad[0x1C0000 + 0x150] ^= 0x01                          # a flip inside IFS1
+        n2 = nor.NorImage(pm, data=bytes(bad))
+        check("a flipped bit in IFS1 fails its checksum",
+              n2.check(n2.region("IFS1")).status == "BAD")
+        bad = bytearray(img)
+        bad[0xFC0000 + 0x40 + 20] ^= 0x01                      # a flip in IFS2 data
+        n3 = nor.NorImage(pm, data=bytes(bad))
+        check("a flipped bit inside IFS2 fails the imagefs checksum",
+              n3.check(n3.region("IFS2")).status == "BAD")
+        bad = bytearray(img)
+        bad[0xFC0000 + 0x40] = 0x00                            # break the stream
+        n4 = nor.NorImage("x", data=bytes(bad), layout=lay)
+        r = n4.check(n4.region("IFS2"))
+        check("a broken IFS2 stream is located", r.status == "BAD" and r.bad_at
+              and "chip" in r.detail, r.detail)
+        c, off = nor.chip_location(r.bad_at, lay)
+        check("the located byte really is that chip's byte",
+              (a, b)[c][off] == img[r.bad_at], "chip %d 0x%X" % (c, off))
+        check("persistence marked as unit data",
+              n.region("HBPERSISTENCE").unit and not n.region("IFS2").unit)
+        s = nor.summarise_nor(n)
+        check("summary names the layout", "16-bit interleave" in s)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_version():
     print("\nversion reporting")
     import pcmexplorer
@@ -691,6 +785,7 @@ def main():
     test_report()
     test_timeline()
     test_svg()
+    test_nor()
     test_version()
     test_real_image_if_present()
     print("\n%s" % ("ALL PASSED" if not _fails
