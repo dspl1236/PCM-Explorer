@@ -67,16 +67,20 @@ class FirmwareImage:
 
     kind = "IFS"
 
-    def __init__(self, path):
+    def __init__(self, path, data=None):
+        """Open a .ifs file, or -- with ``data`` -- an image already in memory
+        (a region of a NOR flash dump); ``path`` is then just its label."""
         self.path = path
         self.container = None          # "IFS1" or "IFS2"
-        self.data = self._inflate(path)
+        self.data = self._inflate(path, data)
         self.base, self.image_size, self.hdr_size, self.dir_offset = self._find_imagefs()
         self._entries = None
 
     # -- container handling --
-    def _inflate(self, path):
-        raw = open(path, "rb").read()
+    def _inflate(self, path, raw=None):
+        if raw is None:
+            with open(path, "rb") as f:
+                raw = f.read()
         if len(raw) > 4 and _u32(raw, 0) == QNX_STARTUP_MAGIC:
             self.container = "IFS1"
             return self._inflate_ifs1(raw)

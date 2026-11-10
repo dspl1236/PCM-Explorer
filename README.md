@@ -59,6 +59,9 @@ python explorer.py report disk.img unit.html          # one page you can send
 - **Opens the persistence flash** (`PCM3_HBpersistence.efs`, and MMI `efs-system.efs`)
   — the factory contents of `/HBpersistence`, which is the baseline to compare a real
   car against.
+- **Opens a NOR flash dump** read off the PCM 3.1's two flash chips with a programmer —
+  the two chip files, or one merged 64 MB image — and says which regions are intact
+  (see [NOR flash dumps](#nor-flash-dumps)).
 - **Reads the HMI itself.** The PCM interface is not compiled in; it is data, in
   `.mmi` files. Every string the unit can display in all nine languages — ten on the
   instrument cluster, which is the only place Chinese appears — and the screens, with
@@ -212,6 +215,30 @@ entry is `.` holding its own inode number, its second is `..` holding its parent
 sweeping the raw partition for that signature rebuilds the hierarchy with no metadata at
 all. You get names and structure but not contents, which is usually enough to know what
 was on a drive and whether deeper recovery is worth it.
+
+## NOR flash dumps
+
+A PCM 3.1 that boot-loops at the logo with `memifs2: Decompression failed` on its serial
+console has a corrupt region in its NOR flash, and the only way in is to read the two
+Spansion S29GL256N chips (32 MB each, 64 MB together) with a programmer. In the desktop
+UI, **Open NOR chips...** takes both chip files (or **Open image...** takes a merged
+64 MB dump):
+
+- **The chip wiring is worked out for you.** Concatenated, or interleaved 8/16/32 bits,
+  either chip first, with or without the 16-bit byte swap some programmers apply — the
+  layout that puts the region headers where the flash map says is the one used.
+- **Every region is checked on its own terms.** IFS1 and the emergency IFS carry a QNX
+  checksum; IFS2 is decompressed and its imagefs checksummed. None of that needs an
+  update disc, so a build nobody has a disc for can still be checked. A broken stream is
+  pinned to its flash address *and* to the chip and offset it came from.
+- **Match disc...** compares every region with an update disc (ISO or folder) — its
+  CRC records and its payloads — which also covers the bootloader and FPGA.
+- **IFS1, IFS2 and the persistence regions browse** like the `.ifs` / `.efs` files they
+  are; **Save region...** writes one region (or the merged image) to a new file.
+
+It stays read-only. Repairing a dump — splicing a good region in and splitting the
+result back into chip files — is PCM-Forge's `tools/nor_repair.py`. The persistence
+region holds that unit's own VIN, activation and coding: never take it from another unit.
 
 ## How it works
 
