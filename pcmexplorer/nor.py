@@ -215,13 +215,96 @@ def looks_like_nor(path):
         return False
 
 
+WRAP_MAX = 4096        # longest programmer over-read we accept (seen: 256 bytes)
+
+
+def chip_wrap_extra(size):
+    """Bytes past 32 MB a chip dump may carry. Some programmers read a little
+    past the end of an S29GL256N and wrap to address 0, so the file is
+    32 MB + 256 bytes whose tail repeats the chip's first 256 (seen on a real
+    dump, 2026-11-12). Only that pattern is accepted -- see normalise_chip()."""
+    return size - CHIP_SIZE if CHIP_SIZE < size <= CHIP_SIZE + WRAP_MAX else 0
+
+
+def normalise_chip(data, name="chip"):
+    """(32 MB of chip data, note) -- trims a programmer's wrap-around over-read,
+    refuses anything else that is not exactly 32 MB."""
+    if len(data) == CHIP_SIZE:
+        return data, None
+    extra = chip_wrap_extra(len(data))
+    if extra and data[CHIP_SIZE:] == data[:extra]:
+        return data[:CHIP_SIZE], ("%s: trimmed %d trailing bytes (the programmer read past "
+                                  "the end and wrapped to address 0)" % (name, extra))
+    raise ValueError("%s: %s bytes, one S29GL256N chip is %s bytes"
+                     % (name, "{:,}".format(len(data)), "{:,}".format(CHIP_SIZE))
+                     + (" (the extra bytes do not repeat the chip's start, so they are "
+                        "not a wrap-around read)" if extra else ""))
+
+
 def looks_like_nor_chip(path):
-    """One chip's dump: exactly 32 MB. Whether it really is one only shows
-    once it is paired with the other chip and the layout scores."""
+    """One chip's dump: 32 MB, or 32 MB plus a programmer's wrap-around over-read.
+    Whether it really is a chip only shows once it is paired with the other one
+    and the layout scores."""
     try:
-        return os.path.getsize(path) == CHIP_SIZE
+        size = os.path.getsize(path)
+        if size == CHIP_SIZE:
+            return True
+        extra = chip_wrap_extra(size)
+        if not extra:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(extra)
+            f.seek(CHIP_SIZE)
+            return f.read(extra) == head
     except OSError:
         return False
+
+
+def imagefs_files(img):
+    """[(offset, size, path)] of the regular files in a decompressed imagefs,
+    sorted by offset. Same dirent layout as FirmwareImage.entries()."""
+    if img[:7] != b"imagefs" or len(img) < 20:
+        return []
+    hdr_size, dir_off = struct.unpack_from("<II", img, 12)
+    out, off, end = [], dir_off, min(hdr_size, len(img))
+    while off + 24 <= end:
+        size = struct.unpack_from("<H", img, off)[0]
+        if size < 24 or off + size > end:
+            break
+        mode = struct.unpack_from("<I", img, off + 8)[0]
+        if (mode & 0o170000) == 0o100000:
+            foff, fsz = struct.unpack_from("<II", img, off + 0x18)
+            name = img[off + 0x20:off + size].split(b"\0")[0].decode("latin-1")
+            out.append((foff, fsz, "/" + name.lstrip("/")))
+        off += size
+    return sorted(out)
+
+
+def locate_shift(img, shift):
+    """Where did a decompressed imagefs gain or lose `shift` bytes?
+
+    A corrupt length code inside the LZO stream can leave the stream intact to
+    its end marker but `shift` bytes short (or long). Everything after the
+    damage then sits `shift` bytes off from where the directory says. Files
+    are followed by zero padding up to the next file's start, so the first
+    file whose padding has the next file's start bytes shifted into it (or,
+    for a gain, whose next file's start became zeros) is where it happened.
+    Returns (path, offset) of that file, or None."""
+    files = imagefs_files(img)
+    if not files or shift == 0:
+        return None
+    k = abs(shift)
+    for (foff, fsz, path), (nxt, _s, _p) in zip(files, files[1:]):
+        pad_start = foff + fsz
+        if nxt - pad_start < k or nxt > len(img) + k:
+            continue                      # no padding to test, or past the data
+        if shift < 0:
+            if any(img[nxt - k:nxt]):     # next file's start moved into the padding
+                return path, foff
+        else:
+            if not any(img[nxt:nxt + k]) and any(img[nxt + k:nxt + k + 16]):
+                return path, foff         # next file's start pushed down by k
+    return None
 
 
 class Region(object):
@@ -261,6 +344,7 @@ class NorImage(object):
         self.chip_paths = chip_paths
         self.layout_score = None
         self.layout_ties = []
+        self.notes = []            # e.g. a trimmed programmer over-read
         low = (data[0x2E00000:0x2E00004] == EFS_HEAD
                and data[0x3000000:0x3000004] != EFS_HEAD)
         self.variant = "LOW (no hard drive)" if low else "standard"
@@ -268,15 +352,13 @@ class NorImage(object):
 
     @classmethod
     def from_chips(cls, path_a, path_b):
-        chips = []
+        chips, notes = [], []
         for p in (path_a, path_b):
             with open(p, "rb") as f:
-                d = f.read()
-            if len(d) != CHIP_SIZE:
-                raise ValueError("%s: %s, one S29GL256N chip is %s"
-                                 % (os.path.basename(p), human(len(d)),
-                                    human(CHIP_SIZE)))
+                d, note = normalise_chip(f.read(), os.path.basename(p))
             chips.append(d)
+            if note:
+                notes.append(note)
         layout, best, ties = detect_layout(chips)
         if best < 3:
             raise ValueError("no way of combining these two files puts the PCM 3.1 "
@@ -286,6 +368,7 @@ class NorImage(object):
                   data=combine(chips, layout), layout=layout,
                   chip_paths=(path_a, path_b))
         img.layout_score, img.layout_ties = best, ties
+        img.notes = notes
         return img
 
     def close(self):
@@ -353,6 +436,23 @@ class NorImage(object):
                 return r
             r.used = 0x40 + csize
             out, ip, why = lzo1x.decompress_stream(reg, 0x40)
+            if why == "eof" and len(out) != dsize:
+                # The stream decoded cleanly to its end marker but came out the
+                # wrong length: a corrupt length code somewhere INSIDE it, not
+                # damage at the end. The file directory can name where.
+                r.status = "BAD"
+                r.bad_at = None
+                shift = len(out) - dsize
+                r.detail = ("decompresses to its end marker but %d bytes %s (%s of %s): "
+                            "the damage is inside the stream (a corrupted length "
+                            "code), not where it ends"
+                            % (abs(shift), "short" if shift < 0 else "long",
+                               "{:,}".format(len(out)), "{:,}".format(dsize)))
+                hit = locate_shift(bytes(out), shift)
+                if hit:
+                    r.detail += ("; every file after %s sits %d bytes off, so it "
+                                 "happened inside that file" % (hit[0], abs(shift)))
+                return r
             if why.startswith("error") or len(out) != dsize:
                 r.status = "BAD"
                 r.bad_at = r.start + ip
@@ -488,6 +588,8 @@ def summarise_nor(nor, matches=None):
     if nor.chip_paths:
         lines.append("chips    A = %s\n         B = %s"
                      % (nor.chip_paths[0], nor.chip_paths[1]))
+    for note in getattr(nor, "notes", []):
+        lines.append("note     %s" % note)
     if nor.layout_ties and len(nor.layout_ties) > 1:
         lines.append("WARNING  %d layouts fit equally well; the regions may be "
                      "mis-assembled" % len(nor.layout_ties))
