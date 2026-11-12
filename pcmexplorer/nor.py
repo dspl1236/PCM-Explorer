@@ -235,7 +235,8 @@ def normalise_chip(data, name="chip"):
     if extra and data[CHIP_SIZE:] == data[:extra]:
         return data[:CHIP_SIZE], ("%s: trimmed %d trailing bytes (the programmer read past "
                                   "the end and wrapped to address 0)" % (name, extra))
-    raise ValueError("%s: %s, one S29GL256N chip is %s" % (name, human(len(data)), human(CHIP_SIZE))
+    raise ValueError("%s: %s bytes, one S29GL256N chip is %s bytes"
+                     % (name, "{:,}".format(len(data)), "{:,}".format(CHIP_SIZE))
                      + (" (the extra bytes do not repeat the chip's start, so they are "
                         "not a wrap-around read)" if extra else ""))
 
