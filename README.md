@@ -229,11 +229,16 @@ UI, **Open NOR chips...** takes both chip files (or **Open image...** takes a me
 
 - **The chip wiring is worked out for you.** Concatenated, or interleaved 8/16/32 bits,
   either chip first, with or without the 16-bit byte swap some programmers apply — the
-  layout that puts the region headers where the flash map says is the one used.
+  layout that puts the region headers where the flash map says is the one used. A chip
+  file of 32 MB + 256 bytes, from a programmer that reads past the end and wraps to
+  address 0, is recognised and trimmed.
 - **Every region is checked on its own terms.** IFS1 and the emergency IFS carry a QNX
   checksum; IFS2 is decompressed and its imagefs checksummed. None of that needs an
   update disc, so a build nobody has a disc for can still be checked. A broken stream is
-  pinned to its flash address *and* to the chip and offset it came from.
+  pinned to its flash address *and* to the chip and offset it came from. A stream that
+  decodes cleanly but comes out short (a corrupted length code inside it — on a real
+  unit, the `memifs2: Decompression failed` boot loop) is traced through the file
+  directory to the file the bytes went missing from.
 - **Match disc...** compares every region with an update disc (ISO or folder) — its
   CRC records and its payloads — which also covers the bootloader and FPGA.
 - **IFS1, IFS2 and the persistence regions browse** like the `.ifs` / `.efs` files they

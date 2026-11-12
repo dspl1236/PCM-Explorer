@@ -736,6 +736,57 @@ def test_nor():
         s = nor.summarise_nor(n)
         check("summary names the layout", "16-bit interleave" in s)
 
+        # a programmer that reads 256 bytes past the end and wraps to address 0
+        # (a real S29GL256N dump, 2026-11-12): accepted and trimmed
+        wa, wb = os.path.join(tmp, "wa.bin"), os.path.join(tmp, "wb.bin")
+        with open(wa, "wb") as f:
+            f.write(a + a[:256])
+        with open(wb, "wb") as f:
+            f.write(b + b[:256])
+        check("looks_like_nor_chip() accepts a wrap-around over-read", nor.looks_like_nor_chip(wa))
+        nw = nor.NorImage.from_chips(wa, wb)
+        check("wrap-around chips merge to the same image",
+              nw.data == bytes(img) and len(nw.notes) == 2, str(nw.notes))
+        with open(wa, "wb") as f:                              # extra bytes that are NOT a wrap
+            f.write(a + b"\x55" * 256)
+        check("looks_like_nor_chip() rejects other extra bytes", not nor.looks_like_nor_chip(wa))
+        try:
+            nor.NorImage.from_chips(wa, wb); refused = False
+        except ValueError:
+            refused = True
+        check("from_chips() refuses extra bytes that are not a wrap", refused)
+
+        # IFS2 that decodes cleanly to its end marker but short: the damage is
+        # inside the stream, and the file directory names the file it is in
+        fs = bytearray(0x400)
+        fs[0:7] = b"imagefs"
+        struct.pack_into("<III", fs, 8, len(fs), 0x100, 0x40)  # image_size, hdr_size, dir_offset
+        o = 0x40                                               # dirents packed back to back
+        for k, (path, off) in enumerate((("a.bin", 0x100), ("b.bin", 0x200))):
+            ent = bytearray(0x20) + path.encode() + b"\0" * (8 - len(path) % 8)
+            struct.pack_into("<HHII", ent, 0, len(ent), 0, 2 + k, 0o100644)
+            struct.pack_into("<II", ent, 0x18, off, 0x80)
+            fs[o:o + len(ent)] = ent
+            o += len(ent)
+            fs[off:off + 0x80] = bytes((i * 7 + 1 + k) & 0xFF or 1 for i in range(0x80))
+        short = bytes(fs[:0x120]) + bytes(fs[0x130:])          # 16 bytes lost inside a.bin
+        L = len(short)
+        z, rem = divmod(L - 18, 255)
+        if rem == 0:
+            z, rem = z - 1, 255
+        lzo = b"\x00" + b"\x00" * z + bytes([rem]) + short + b"\x11\x00\x00"   # one literal run + end
+        hdr = bytearray(0x40)
+        hdr[0:8] = nor.HBCIFS
+        struct.pack_into("<II", hdr, 8, len(fs), len(lzo))
+        eofimg = bytearray(img)
+        eofimg[0xFC0000:0xFC0000 + 0x40 + len(lzo)] = bytes(hdr) + lzo
+        n5 = nor.NorImage("x", data=bytes(eofimg))
+        r5 = n5.check(n5.region("IFS2"))
+        check("an IFS2 that ends cleanly but short is BAD", r5.status == "BAD", r5.detail)
+        check("...and is reported as damage inside the stream, not at its end",
+              "inside the stream" in r5.detail and r5.bad_at is None, r5.detail)
+        check("...in the file the bytes went missing from", "/a.bin" in r5.detail, r5.detail)
+
         # the CLI over the same files
         import contextlib
         import io
