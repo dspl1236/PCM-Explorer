@@ -243,6 +243,11 @@ UI, **Open NOR chips...** takes both chip files (or **Open image...** takes a me
   CRC records and its payloads — which also covers the bootloader and FPGA.
 - **IFS1, IFS2 and the persistence regions browse** like the `.ifs` / `.efs` files they
   are; **Save region...** writes one region (or the merged image) to a new file.
+  The persistence regions of a dump from a car are read by the flash file system's own
+  structure, with real folders: a unit that has been in use has rewritten its files many
+  times and split them across erase units, and they still come out whole.
+- A PCM-Forge **Flash Backup** (`pcm_flash.bin`, copied over USB with no programmer) is
+  one merged 64 MB image and opens the same way.
 
 The same from the command line, on a merged dump or straight from the two chips:
 

@@ -321,6 +321,105 @@ def test_efs_detect():
     check("extent alignment is 4", EfsImage.ALIGN == 4)
 
 
+def make_live_f3s():
+    """A tiny F3S image laid out the way a car's flash ends up: logical unit 1
+    is NOT the first physical unit, a file is split across two units, one
+    extent has been superseded by a rewrite, and a deleted (empty) entry is
+    left in a directory chain.  Unit size 4 KB."""
+    US, HDR = 0x1000, 32
+    units = {0: bytearray(b"\xff" * US), 1: bytearray(b"\xff" * US),
+             2: bytearray(b"\xff" * US)}
+    logi = {0: 2, 1: 1, 2: 0xFFFF}          # physical -> logical; 2 is spare
+    cursor = {p: 0x28 for p in units}
+    count = {p: 0 for p in units}
+    phys_of = {v: k for k, v in logi.items()}
+    for p, u in units.items():
+        u[0:4] = b"\x10\x00\x4c\xff"
+        struct.pack_into("<HHIHH", u, 4, 12, 0xFFFF, 7, 1, 2)
+        if logi[p] != 0xFFFF:
+            struct.pack_into("<HH", u, 0x10, 24, logi[p])
+        else:
+            u[0x10:0x12] = b"\xff\xff"
+
+    def ext(lu, text, nxt=None, sup=None, idx=None):
+        p = phys_of[lu]
+        if idx is None:
+            idx = count[p]
+        count[p] = max(count[p], idx + 1)
+        off = cursor[p]
+        units[p][off:off + len(text)] = text
+        cursor[p] = (off + len(text) + 3) & ~3
+        h = units[p]
+        o = US - HDR * (idx + 1)
+        h[o:o + 12] = b"\x3c\xfe\xff\xff" * 3
+        struct.pack_into("<HH", h, o + 0x14, off // 4, len(text))
+        def ptr(v):
+            return 0xFFFFFFFF if v is None else (v[0] | (v[1] << 16))
+        struct.pack_into("<II", h, o + 0x18, ptr(nxt), ptr(sup))
+        return (lu, idx)
+
+    def patch(at, field, v):
+        p = phys_of[at[0]]
+        o = US - HDR * (at[1] + 1) + (0x18 if field == "next" else 0x1C)
+        struct.pack_into("<I", units[p], o, v[0] | (v[1] << 16))
+
+    def dirent(name, first, mode):
+        nm = name.encode() + b"\x00"
+        nm += b"\x00" * ((-len(nm)) % 4)
+        return (struct.pack("<HBBHH", 8, 0, len(name) + 1, first[0], first[1]) + nm
+                + struct.pack("<HHIIII", 20, mode, 0, 0, 1700000000, 1700000000))
+
+    ext(1, b"u0", idx=0)                                # unit info (placeholder)
+    ext(1, b"u1", idx=1)                                # unit logi (placeholder)
+    boot = ext(1, struct.pack("<HBB", 24, 3, 0) + b"QSSL_F3S"
+               + struct.pack("<HHHHHH", 13, 3, 1, 2, 1, 3), idx=2)
+    # data: "hello " in logical 2, then "world" in logical 1 (split file);
+    # the first piece is later superseded by "HELLO " in logical 2
+    piece2 = ext(1, b"world", idx=4)
+    old1 = ext(2, b"hello ", nxt=piece2)
+    new1 = ext(2, b"HELLO ", nxt=piece2)
+    patch(old1, "super", new1)
+    gone = ext(2, b"", idx=None)                        # a deleted entry
+    f = ext(2, dirent("greeting.txt", old1, 0o100644), nxt=gone)
+    root = ext(1, dirent("/HBpersistence", f, 0o040755), idx=3)
+    assert root == (1, 3) and boot == (1, 2)
+    return b"".join(bytes(units[p]) for p in sorted(units))
+
+
+def test_efs_tree():
+    print("\nEFS: a live unit's flash, read by the F3S structure")
+    img = make_live_f3s()
+    path = os.path.join(tempfile.gettempdir(), "pcmx_live.efs")
+    with open(path, "wb") as f:
+        f.write(img)
+    try:
+        check("looks_like_efs() accepts an image whose boot record is not near "
+              "the start", looks_like_efs(path))
+        e = EfsImage(path)
+        ents = dict(e.entries())
+        check("read by structure, not the byte scan", e.structured is True,
+              e.structure_error)
+        check("folders are real paths",
+              "/HBpersistence/greeting.txt" in ents, ", ".join(sorted(ents)))
+        g = ents.get("/HBpersistence/greeting.txt")
+        data = e.read_file(g) if g else b""
+        check("a file split across units is joined, through the rewrite",
+              data == b"HELLO world", repr(data))
+        check("its size is the sum of its pieces", g is not None and g["size"] == 11)
+        check("the deleted entry is not listed", len(ents) == 2, str(len(ents)))
+        check("find() by name still works",
+              e.read_file("greeting.txt") == b"HELLO world")
+    finally:
+        os.remove(path)
+    # anything the structure can't parse falls back to the byte scan
+    junk = bytearray(make_live_f3s())
+    junk[0x1000 + 0x0C:0x1000 + 0x10] = b"\x05\x00\x09\x00"   # boot -> nowhere
+    e = EfsImage("broken", data=bytes(junk))
+    e.entries()
+    check("a broken structure falls back to the byte scan",
+          e.structured is False and e.structure_error, e.structure_error)
+
+
 def test_diff():
     print("\ndiff")
     root = os.path.join(tempfile.gettempdir(), "pcmx_diff")
@@ -864,6 +963,7 @@ def main():
     test_firmware_detect()
     test_update_disc()
     test_efs_detect()
+    test_efs_tree()
     test_diff()
     test_hbm5()
     test_hbm5_geom()

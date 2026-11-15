@@ -9,23 +9,46 @@ changed, and what on a given unit is not stock.
 The container identifies itself as ``QSSL_F3S`` in its header.  Audi MMI images
 (``efs-system.efs``) use the same format, so both open here.
 
-Reading it is scan-based rather than a full F3S traversal.  Every file is
-preceded by an 8-byte dirent header (``08 00 <pad> <namelen>``, then the first
-extent's unit and index) followed by the name and a 20-byte ``stat_s`` whose
-top mode nibble gives the file type.  Content runs from the end of the stat to
-the start of the next dirent -- except for QNX-deflate-wrapped payloads, which
-carry an ``iwlyfmbp`` header and a block chain whose end has to be walked,
-because such a blob can contain byte sequences that look like dirents.
+Two readers, tried in this order:
 
-The approach is taken from ``extract_f3s_efs.py`` in the author's MMI3G-Toolkit,
-which solved this for Audi images first; it works unmodified on Porsche ones.
+**1. The F3S structure** (``_F3STree``), which is what a live unit needs.  The
+image is a row of erase units.  Each unit starts with a 40-byte header:
 
-**Directory nesting is not reconstructed.**  A dirent records its own name and
-first extent but not its parent -- the tree lives in each directory's extent
-list, which this reader does not walk.  Entries are therefore reported flat, in
-image order, with real names, modes and contents.  That is enough to say what a
-file contains and whether it differs from another image, which is what the tool
-is for; it is not enough to say which folder it sat in.
+    +0x00  u16 16, 'L', 0xFF        unit info: struct size, endianness
+    +0x04  u16 unit_pow2            log2 of the unit size (18 = 256 KB)
+    +0x08  u32 erase count
+    +0x0C  u16 unit, u16 index      where the boot record lives
+    +0x10  u16 24, u16 logical      this unit's LOGICAL number (0xFFFF = spare)
+    +0x14  u32 age, u8 md5[16]
+
+Extent headers (32 bytes each) grow down from the END of the unit: extent N's
+header sits at ``unit_size - 32 * (N + 1)``.  A header holds the status (three
+copies), then at +0x14 ``u16 text_offset / 4, u16 text_size``, then two extent
+pointers (``u16 logical unit, u16 index``): ``next`` and ``super``.  A file or
+directory is a chain along ``next``; when the unit rewrites an extent, the old
+header's ``super`` points at its replacement, so every hop resolves through
+``super`` first.  The boot record (``QSSL_F3S``) names the root dirent.
+
+A dirent's text is ``u16 8, u8, u8 namelen, extent pointer, name (4-aligned),
+stat_s(20)``.  For a directory the pointer is its first child, and the
+children are a ``next`` chain; for a file it is the first data extent.  Size is
+the sum of the data extents -- the stat has no size field.
+
+A factory ``PCM3_HBpersistence.efs`` happens to be laid out in order (logical
+unit 1 first, every file in one piece), which is why a byte scan worked on it.
+A unit that has been in a car has rewritten its files many times: the boot
+record moves to whichever physical unit now holds logical unit 1, and a file
+is split across units.  Only this reader gets those right.
+
+**2. A byte scan** (``_scan``), the fallback when the structure does not parse.
+Every file is preceded by an 8-byte dirent header (``08 00 <pad> <namelen>``)
+followed by the name and a 20-byte ``stat_s``.  Content runs from the end of
+the stat to the start of the next dirent -- except for QNX-deflate-wrapped
+payloads, which carry an ``iwlyfmbp`` header and a block chain whose end has to
+be walked, because such a blob can contain byte sequences that look like
+dirents.  The approach is taken from ``extract_f3s_efs.py`` in the author's
+MMI3G-Toolkit.  It reports entries flat (no folders), and on a live unit's
+flash it gets sizes and contents wrong, because files are not contiguous.
 """
 import re
 import struct
@@ -43,14 +66,137 @@ DEFLATE_MAGIC = b"iwlyfmbp"    # QNX-deflate wrapper
 VALID_BLKSIZES = (4096, 8192, 16384, 32768)
 
 
+UNIT_HEAD = b"\x10\x00\x4c\xff"   # unit info: struct size 16, 'L', pad
+NO_PTR = 0xFFFFFFFF
+
+
 def looks_like_efs(path):
-    """Cheap probe -- is this a QNX F3S flash image?"""
+    """Cheap probe -- is this a QNX F3S flash image?
+
+    A factory image has ``QSSL_F3S`` near the start.  An image saved from a
+    car's flash usually does not -- the boot record is wherever logical unit 1
+    ended up -- but it still starts with an F3S unit header.
+    """
     try:
         with open(path, "rb") as f:
             head = f.read(MAGIC_WINDOW)
-        return F3S_MAGIC in head
+        return F3S_MAGIC in head or _is_unit_header(head)
     except Exception:
         return False
+
+
+def _is_unit_header(b):
+    """An F3S erase-unit header: the info magic and a sane unit size."""
+    if len(b) < 0x14 or b[:4] != UNIT_HEAD:
+        return False
+    pow2 = struct.unpack_from("<H", b, 4)[0]
+    return 12 <= pow2 <= 24 and b[0x10:0x12] in (b"\x18\x00", b"\xff\xff")
+
+
+class _F3STree(object):
+    """Walk an F3S image by its own structure (see the module docstring).
+
+    Raises ValueError on anything that does not add up, so the caller can fall
+    back to the byte scan.
+    """
+
+    HDR = 32
+    MAX_HOPS = 4096           # super/next chains longer than this are corrupt
+
+    def __init__(self, data):
+        self.d = data
+        if not _is_unit_header(data[:0x28]):
+            raise ValueError("no F3S unit header")
+        self.usize = 1 << struct.unpack_from("<H", data, 4)[0]
+        self.phys = {}                       # logical unit -> byte offset
+        for base in range(0, len(data) - self.usize + 1, self.usize):
+            h = data[base:base + 0x28]
+            if not _is_unit_header(h) or h[0x10:0x12] == b"\xff\xff":
+                continue                     # not F3S, or a spare unit
+            logi = struct.unpack_from("<H", h, 0x12)[0]
+            self.phys.setdefault(logi, base)
+        if 1 not in self.phys:
+            raise ValueError("no logical unit 1")
+        boot_logi, boot_idx = struct.unpack_from("<HH", data, self.phys[1] + 0x0C)
+        boot = self.text(self.resolve(boot_logi, boot_idx))
+        if boot[4:12] != F3S_MAGIC:
+            raise ValueError("boot record has no %s" % F3S_MAGIC.decode())
+        self.root = struct.unpack_from("<HH", boot, 20)
+
+    def header(self, logi, idx):
+        base = self.phys.get(logi)
+        if base is None:
+            raise ValueError("pointer to missing unit %d" % logi)
+        o = base + self.usize - self.HDR * (idx + 1)
+        if o < base + 0x28:
+            raise ValueError("extent index %d out of unit %d" % (idx, logi))
+        off4, size = struct.unpack_from("<HH", self.d, o + 0x14)
+        nxt, sup = struct.unpack_from("<II", self.d, o + 0x18)
+        text_at = base + off4 * 4
+        if text_at + size > base + self.usize:
+            raise ValueError("extent %d,%d runs past its unit" % (logi, idx))
+        return {"text_at": text_at, "size": size, "next": nxt, "super": sup}
+
+    def resolve(self, logi, idx):
+        h = self.header(logi, idx)
+        hops = 0
+        while h["super"] != NO_PTR:
+            h = self.header(h["super"] & 0xFFFF, h["super"] >> 16)
+            hops += 1
+            if hops > self.MAX_HOPS:
+                raise ValueError("super chain loops")
+        return h
+
+    def text(self, h):
+        return self.d[h["text_at"]:h["text_at"] + h["size"]]
+
+    def chain(self, logi, idx):
+        out = []
+        while (logi, idx) != (0xFFFF, 0xFFFF):
+            h = self.resolve(logi, idx)
+            out.append(h)
+            if h["next"] == NO_PTR or len(out) > self.MAX_HOPS:
+                break
+            logi, idx = h["next"] & 0xFFFF, h["next"] >> 16
+        return out
+
+    def entries(self):
+        """[(path, entry)] for every dirent reachable from the root."""
+        out = []
+        self._walk(self.root, "", out, 0)
+        if not out:
+            raise ValueError("empty tree")
+        return out
+
+    def _walk(self, ptr, parent, out, depth):
+        if depth > 64:
+            raise ValueError("directory nesting too deep")
+        for h in self.chain(*ptr):
+            if h["size"] == 0:
+                continue                     # a deleted entry left in the chain
+            t = self.text(h)
+            if len(t) < 8 or t[:2] != b"\x08\x00":
+                raise ValueError("chain reached a non-dirent extent")
+            nlen = t[3]
+            first = struct.unpack_from("<HH", t, 4)
+            name = t[8:8 + nlen].split(b"\x00")[0].decode("utf-8", "replace")
+            so = 8 + ((nlen + 3) & ~3)
+            if len(t) < so + 20 or t[so:so + 2] != b"\x14\x00":
+                raise ValueError("dirent %r has no stat" % name)
+            mode = _u16(t, so + 2)
+            ftype = (mode >> 12) & 0xF
+            path = parent + "/" + name.strip("/")
+            ent = {"mode": mode, "uid": _u32(t, so + 4), "gid": _u32(t, so + 8),
+                   "mtime": _u32(t, so + 12), "_ftype": _FTYPE.get(ftype, "?"),
+                   "path": path, "_extents": []}
+            if ftype == 0x4:
+                out.append((path, ent))
+                if first != (0xFFFF, 0xFFFF):
+                    self._walk(first, path, out, depth + 1)
+                continue
+            if first != (0xFFFF, 0xFFFF):
+                ent["_extents"] = [(x["text_at"], x["size"]) for x in self.chain(*first)]
+            out.append((path, ent))
 
 
 def _u16(d, off):
@@ -76,10 +222,13 @@ class EfsImage(object):
             with open(path, "rb") as f:
                 data = f.read()
         self.data = bytes(data)
-        if F3S_MAGIC not in self.data[:MAGIC_WINDOW]:
+        if not (F3S_MAGIC in self.data[:MAGIC_WINDOW]
+                or (_is_unit_header(self.data[:0x28]) and F3S_MAGIC in self.data)):
             raise ValueError("not a QNX F3S image (no %s header)"
                              % F3S_MAGIC.decode())
         self._entries = None
+        self.structured = None    # True: real tree; False: byte-scan fallback
+        self.structure_error = ""
 
     # -- container identity --
     @property
@@ -218,10 +367,41 @@ class EfsImage(object):
         return stop
 
     def entries(self):
-        """[(path, entry)] in image order, shaped like the firmware reader's."""
+        """[(path, entry)], shaped like the firmware reader's: the real tree
+        when the F3S structure parses, otherwise the flat byte scan."""
         if self._entries is not None:
             return self._entries
+        try:
+            tree = _F3STree(self.data).entries()
+        except (ValueError, struct.error, IndexError) as e:
+            self.structured, self.structure_error = False, str(e)
+            self._entries = self._scan_entries()
+            return self._entries
+        out = []
+        for ino, (path, ent) in enumerate(tree, 1):
+            ext = ent.pop("_extents")
+            is_file = ent["_ftype"] == "FILE"
+            ent.update({
+                "ino": ino,
+                "size": sum(n for _o, n in ext),
+                "levels": 0,
+                "ptr": [],
+                "_data_off": ext[0][0] if ext else None,
+                "_extents": ext,
+                "_target": "",
+            })
+            if ent["_ftype"] == "LINK":
+                ent["_target"] = b"".join(self.data[o:o + n] for o, n in ext) \
+                    .split(b"\x00")[0].decode("utf-8", "replace")
+            elif not is_file:
+                ent["size"] = 0
+            out.append((path, ent))
+        self.structured = True
+        self._entries = out
+        return out
 
+    def _scan_entries(self):
+        """The byte-scan fallback: flat names, contiguous content."""
         found = sorted(self._scan(), key=lambda e: e["stat_off"])
 
         # Drop phantom dirents that live inside compressed blobs.
@@ -287,6 +467,8 @@ class EfsImage(object):
                 return b""
         if ent.get("_data_off") is None:
             return b""
+        if ent.get("_extents"):                 # the real tree: join the pieces
+            return b"".join(self.data[o:o + n] for o, n in ent["_extents"])
         return self.data[ent["_data_off"]:ent["_data_off"] + ent["size"]]
 
     def read_range(self, ent, start=0, length=None):
@@ -304,8 +486,9 @@ class EfsImage(object):
         ents = self.entries()
         nf = sum(1 for _p, e in ents if e["_ftype"] == "FILE")
         nd = sum(1 for _p, e in ents if e["_ftype"] == "DIR")
-        return ("F3S EFS image, %d files / %d dirs, %.1f MB"
-                % (nf, nd, len(self.data) / 1e6))
+        return ("F3S EFS image, %d files / %d dirs, %.1f MB%s"
+                % (nf, nd, len(self.data) / 1e6,
+                   "" if self.structured else " (byte scan: no folders)"))
 
 
 def summarise_efs(efs):
@@ -338,7 +521,12 @@ def summarise_efs(efs):
         for p, e in big:
             L.append("  %9s  %s" % ("%.1f KB" % (e["size"] / 1024.0), p))
         L.append("")
-    L.append("Directory nesting is not reconstructed -- F3S keeps the tree in each")
-    L.append("directory's extent list, which this reader does not walk. Names,")
-    L.append("modes and contents are real; the folder each file sat in is not shown.")
+    if efs.structured:
+        L.append("Read by the F3S structure: folders, sizes and contents are the")
+        L.append("unit's own, including files a live unit has split across units.")
+    else:
+        L.append("Read by a byte scan (the F3S structure did not parse: %s)."
+                 % (efs.structure_error or "unknown"))
+        L.append("Names and modes are real, but folders are not shown, and on a")
+        L.append("unit's live flash the sizes and contents can be wrong.")
     return "\n".join(L)

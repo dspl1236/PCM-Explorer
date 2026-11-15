@@ -117,6 +117,12 @@ def _fw_find(fw, path):
     for pth, e in fw.entries():
         if pth == want:
             return pth, e
+    # An EFS read by its structure lists paths under its root folder
+    # (/HBpersistence/vin); a path given relative to that root (/vin) still works.
+    if isinstance(fw, EfsImage):
+        for pth, e in fw.entries():
+            if pth.count("/") > 1 and pth[pth.index("/", 1):] == want:
+                return pth, e
     return None, None
 
 

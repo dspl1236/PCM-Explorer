@@ -511,7 +511,9 @@ class NorImage(object):
         if r.kind == "ifs2":
             csize = struct.unpack_from("<I", reg, 12)[0]
             return FirmwareImage(label, data=reg[:0x40 + csize])
-        if r.kind == "efs" and F3S_MAGIC in reg[:0x200]:
+        # A live unit's boot record sits wherever logical unit 1 now is, so
+        # look for it anywhere in the region, not just near the start.
+        if r.kind == "efs" and F3S_MAGIC in reg:
             return EfsImage(label, data=reg)
         return None
 
