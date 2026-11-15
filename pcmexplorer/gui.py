@@ -785,6 +785,15 @@ class Explorer(tk.Tk):
                     folders[walked] = self.tree.insert(parent, "end", text=seg + "/",
                                                        values=("", ""))
                 parent = folders[walked]
+            if is_dir(ent):
+                # an image that lists its folders (an EFS read by its own
+                # structure) gets one node per folder, not a leaf plus a folder
+                full = "/" + "/".join(parts)
+                if full not in folders:
+                    folders[full] = self.tree.insert(parent, "end", text=parts[-1] + "/",
+                                                     values=("", ent["ino"]))
+                    self.nodes[folders[full]] = ent
+                continue
             label = parts[-1] + ("@" if is_link(ent) else "")
             size = "" if is_dir(ent) else human(ent["size"])
             iid = self.tree.insert(parent, "end", text=label, values=(size, ent["ino"]))
