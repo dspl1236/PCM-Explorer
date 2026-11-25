@@ -6,11 +6,13 @@ These are the files in an official update package. Being able to read them turns
 into a directory listing -- useful for comparing two releases, checking whether a
 feature exists in a given version, or pulling a single binary out for analysis.
 
-TWO CONTAINERS, both LZO1X-compressed:
+TWO CONTAINERS:
 
   IFS1  a real QNX boot image. 256-byte startup header at offset 0 (magic
         0x00FF7EEB), then the startup code, then the imagefs. The payload is
-        stored as a chain of length-prefixed LZO chunks.
+        stored as a chain of length-prefixed chunks, LZO1X on the PCM 3.1;
+        the header's flags1 compression bits say which (0x08 LZO, 0x0C UCL
+        NRV2B -- the Audi MMI 3G+ emergency image ifs-emg is UCL).
 
   IFS2  not a QNX boot image at all -- no startup header. It is a single
         self-terminating LZO1X stream beginning at offset 0x40.
@@ -30,10 +32,11 @@ Read-only: nothing here writes to the source file.
 import os
 import struct
 
-from . import lzo1x
+from . import lzo1x, ucl
 from .core import human, mode_str, S_IFMT, S_IFDIR, S_IFREG, S_IFLNK
 
 QNX_STARTUP_MAGIC = 0x00FF7EEB
+COMPRESS_MASK, COMPRESS_UCL = 0x1C, 0x0C     # startup header flags1
 IFS2_LZO_OFFSET = 0x40
 IMAGEFS_SIG = b"imagefs"
 
@@ -72,6 +75,7 @@ class FirmwareImage:
         (a region of a NOR flash dump); ``path`` is then just its label."""
         self.path = path
         self.container = None          # "IFS1" or "IFS2"
+        self.compression = "LZO"       # "UCL" for a UCL-built IFS1
         self.data = self._inflate(path, data)
         self.base, self.image_size, self.hdr_size, self.dir_offset = self._find_imagefs()
         self._entries = None
@@ -96,10 +100,17 @@ class FirmwareImage:
         The startup header and code are stored plain; only the imagefs that
         follows is chunked. Each chunk is a 2-byte BIG-ENDIAN length (note: the
         only big-endian field in an otherwise little-endian image) followed by
-        that many LZO1X bytes. A zero length terminates the chain.
+        that many compressed bytes. A zero length terminates the chain. The
+        chunks are UCL NRV2B when flags1 says so, LZO1X otherwise.
         """
         startup_size = _u32(raw, 0x20)
         stored_size = _u32(raw, 0x24)
+        if raw[6] & COMPRESS_MASK == COMPRESS_UCL:
+            self.compression = "UCL"
+            unpack = ucl.decompress
+        else:
+            self.compression = "LZO"
+            unpack = lambda b: lzo1x.decompress_stream(b, 0)[0]
         out = bytearray(raw[:startup_size])          # startup stays as-is
         pos = startup_size
         limit = min(stored_size, len(raw)) if stored_size else len(raw)
@@ -108,8 +119,7 @@ class FirmwareImage:
             pos += 2
             if clen == 0 or pos + clen > limit:
                 break
-            chunk, _ip, _r = lzo1x.decompress_stream(raw[pos:pos + clen], 0)
-            out += chunk
+            out += unpack(raw[pos:pos + clen])
             pos += clen
         return bytes(out)
 

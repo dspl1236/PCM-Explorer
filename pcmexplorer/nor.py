@@ -31,6 +31,22 @@ Flash map (the ADR<address> folders of an OEM update disc):
   0x0BC0000 EMERGENCY   0x0FC0000 IFS2       0x3000000 HBPERSISTENCE
   0x3F00000 UPDATEHISTORY
   (the no-HDD LOW variant: DEBUG at 0x2B40000, HBPERSISTENCE at 0x2E00000)
+
+Audi MMI 3G+ (and its VW RNS-850 sibling) is the same Harman design with a
+128 MB /dev/fs0, read off a running unit with ``cat /dev/fs0``. Its map (the
+FlashStartAddress lines of the update set's metainfo2.txt, K0942):
+
+  0x0000000 IPL         0x0040000 FPGA       0x0100000 FPGA-EMG
+  0x01C0000 IFS-EMG     0x0680000 IFS-ROOT   0x3100000 EFS-EXTENDED
+  then EFS-SYSTEM and EFS-PERSIST, and a 1 MB tail at 0x7F00000 that no
+  update image covers (it starts "BIOSCTRL")
+
+The three QNX flash filesystems are found the way the unit's own flash driver
+finds them, not from a fixed table: from the first F3S erase unit on, each
+partition's boot record (``QSSL_F3S``) says how many 256 KB units it has, and
+the next partition starts after them. On a car the boot record is wherever
+that partition's logical unit 1 has moved to -- efs-persist's was physical unit
+42 of 116 on a K0942_3 A6 -- so it is searched for, not expected at the start.
 """
 import os
 import re
@@ -80,6 +96,111 @@ PROBES = [(0x0100000, FPGA), (0x01C0000, QNX_STARTUP), (0x0BC0000, QNX_STARTUP),
           (0x0FC0000, HBCIFS), (0x3000000, EFS_HEAD), (0x2E00000, EFS_HEAD),
           (0x3F00000, EFS_HEAD)]
 PROBES_EXPECTED = 6          # a standard and a LOW image each place six
+
+# ---------------------------------------------------------------- MMI 3G+
+MMI_SIZE = 128 * 1024 * 1024
+F3S_UNIT = 0x40000
+MMI_EFS_START = 0x3100000
+MMI_TAIL = 0x7F00000
+BIOSCTRL = b"BIOSCTRL"
+MAP_MMI_RAW = [
+    ("IPL",       0x0000000, 0x0040000, None,        "raw", False),
+    ("FPGA",      0x0040000, 0x0100000, FPGA,        "raw", False),
+    ("FPGA-EMG",  0x0100000, 0x01C0000, FPGA,        "raw", False),
+    ("IFS-EMG",   0x01C0000, 0x0680000, QNX_STARTUP, "ifs", False),
+    ("IFS-ROOT",  0x0680000, MMI_EFS_START, QNX_STARTUP, "ifs", False),
+]
+MMI_EFS_NAMES = ("EFS-EXTENDED", "EFS-SYSTEM", "EFS-PERSIST")
+MMI_PROBES = [(0x0040000, FPGA), (0x0100000, FPGA), (0x01C0000, QNX_STARTUP),
+              (0x0680000, QNX_STARTUP), (MMI_EFS_START, EFS_HEAD)]
+DESCRIPTION.update({
+    "FPGA-EMG": "emergency FPGA bitstream",
+    "IFS-EMG": "emergency boot image",
+    "IFS-ROOT": "QNX boot image (kernel, drivers, MMI3GApplication)",
+    "EFS-EXTENDED": "flash filesystem /mnt/efs-extended",
+    "EFS-SYSTEM": "flash filesystem /mnt/efs-system (Java HMI, scripts)",
+    "EFS-PERSIST": "persistence (/HBpersistence): this unit's coding, keys, settings",
+    "TAIL": "not covered by any update image (starts BIOSCTRL)",
+})
+
+
+def mmi_partitions(data):
+    """[(start, end, boot record offset)] of the F3S partitions of an MMI 3G+
+    /dev/fs0, in flash order. Each one runs from its first unit for as many
+    units as its boot record says."""
+    out = []
+    off = MMI_EFS_START if data[MMI_EFS_START:MMI_EFS_START + 4] == EFS_HEAD else None
+    if off is None:
+        off = next((o for o in range(0, MMI_TAIL, F3S_UNIT)
+                    if data[o:o + 4] == EFS_HEAD), None)
+    while off is not None and off < MMI_TAIL and data[off:off + 4] == EFS_HEAD:
+        boot = data.find(F3S_MAGIC, off, MMI_TAIL)
+        if boot < 0:
+            break
+        units = struct.unpack_from("<H", data, boot + 10)[0]
+        end = off + units * F3S_UNIT
+        if units == 0 or end > MMI_TAIL or not off <= boot < end:
+            break                                # does not add up: stop here
+        out.append((off, end, boot))
+        off = end
+    return out
+
+
+def _efs_mount_name(data):
+    """'EFS-PERSIST' from a partition whose root entry is /mnt/efs-persist (the
+    root dirent carries the whole mount path as its name), else None."""
+    from .efs import _F3STree
+    try:
+        tree = _F3STree(data)
+        for h in tree.chain(*tree.root):
+            t = tree.text(h)
+            if h["size"] < 8 or t[:2] != b"\x08\x00":
+                continue
+            name = t[8:8 + t[3]].split(b"\0")[0].decode("latin-1").rstrip("/")
+            base = name.rsplit("/", 1)[-1]
+            if base.startswith("efs-"):
+                return base.upper()
+    except (ValueError, struct.error, IndexError):
+        pass
+    return None
+
+
+def mmi_map(data):
+    """The MMI 3G+ region list for a 128 MB /dev/fs0."""
+    rows = list(MAP_MMI_RAW)
+    parts = mmi_partitions(data)
+    for i, (start, end, _boot) in enumerate(parts):
+        name = (_efs_mount_name(data[start:end])
+                or (MMI_EFS_NAMES[i] if len(parts) == len(MMI_EFS_NAMES)
+                    else "EFS@%07X" % start))
+        rows.append((name, start, end, EFS_HEAD, "efs", name == "EFS-PERSIST"))
+    efs_end = parts[-1][1] if parts else MMI_EFS_START
+    if efs_end < MMI_TAIL:
+        rows.append(("SPARE", efs_end, MMI_TAIL, None, "raw", False))
+    # not checked against "BIOSCTRL": nothing says every unit's tail starts so
+    rows.append(("TAIL", MMI_TAIL, MMI_SIZE, None, "raw", True))
+    return rows
+
+
+def looks_like_mmi_nor(data_or_path):
+    """A 128 MB MMI 3G+ /dev/fs0 dump, recognised by its region headers."""
+    try:
+        if isinstance(data_or_path, (bytes, bytearray)):
+            d = data_or_path
+            if len(d) != MMI_SIZE:
+                return False
+            hits = sum(d[a:a + len(m)] == m for a, m in MMI_PROBES)
+        else:
+            if os.path.getsize(data_or_path) != MMI_SIZE:
+                return False
+            hits = 0
+            with open(data_or_path, "rb") as f:
+                for a, m in MMI_PROBES:
+                    f.seek(a)
+                    hits += f.read(len(m)) == m
+        return hits >= 3
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------- layouts
@@ -201,7 +322,10 @@ def wordsum(buf):
 
 
 def looks_like_nor(path):
-    """A merged 64 MB dump, recognised by where its region headers sit."""
+    """A merged 64 MB PCM 3.1 dump or a 128 MB MMI 3G+ one, recognised by where
+    its region headers sit."""
+    if looks_like_mmi_nor(path):
+        return True
     try:
         if os.path.getsize(path) != FULL_SIZE:
             return False
@@ -326,7 +450,8 @@ class Region(object):
 
 
 class NorImage(object):
-    """A PCM 3.1 NOR flash image, from one merged file or from two chip dumps."""
+    """A PCM 3.1 NOR flash image, from one merged file or from two chip dumps --
+    or an Audi MMI 3G+ /dev/fs0 (128 MB, one file)."""
 
     kind = "NOR"
 
@@ -335,16 +460,22 @@ class NorImage(object):
         if data is None:
             with open(path, "rb") as f:
                 data = f.read()
-        if len(data) != FULL_SIZE:
-            raise ValueError("%s: %s, a PCM 3.1 flash is %s"
+        if len(data) not in (FULL_SIZE, MMI_SIZE):
+            raise ValueError("%s: %s, a PCM 3.1 flash is %s (an MMI 3G+ one %s)"
                              % (os.path.basename(str(path)), human(len(data)),
-                                human(FULL_SIZE)))
+                                human(FULL_SIZE), human(MMI_SIZE)))
         self.data = data
         self.layout = layout            # None for a merged file
         self.chip_paths = chip_paths
         self.layout_score = None
         self.layout_ties = []
         self.notes = []            # e.g. a trimmed programmer over-read
+        if len(data) == MMI_SIZE:
+            self.product = "Audi MMI 3G+"
+            self.variant = "MMI 3G+"
+            self.regions = [Region(*r) for r in mmi_map(data)]
+            return
+        self.product = "PCM 3.1"
         low = (data[0x2E00000:0x2E00004] == EFS_HEAD
                and data[0x3000000:0x3000004] != EFS_HEAD)
         self.variant = "LOW (no hard drive)" if low else "standard"
@@ -428,6 +559,8 @@ class NorImage(object):
                 r.status = "OK"
                 r.detail = "QNX boot image, %s, checksum good" % human(stored)
             return r
+        if r.kind == "ifs":
+            return self._check_ifs(r, reg)
         if r.kind == "ifs2":
             dsize, csize = struct.unpack_from("<II", reg, 8)
             if not 0 < csize <= len(reg) - 0x40:
@@ -485,11 +618,68 @@ class NorImage(object):
             r.used = len(reg)
             r.status = "UNVERIFIED"
             r.detail = "QNX flash filesystem; it has no image checksum to test"
+            if self.product != "PCM 3.1":
+                r.detail += self._efs_walk(r, reg)
             return r
         r.used = len(reg.rstrip(b"\xff"))
         r.status = "UNVERIFIED"
-        r.detail = "no self-check known; match it against an update disc"
+        r.detail = ("no self-check known; match it against an update disc"
+                    if self.product == "PCM 3.1" else
+                    "no self-check known; compare it with the update set's image")
+        if r.name == "TAIL" and reg[:len(BIOSCTRL)] == BIOSCTRL:
+            r.detail = ("starts BIOSCTRL, %s used; no update image covers it, so "
+                        "keep it as this unit's own" % human(r.used))
         return r
+
+    def _check_ifs(self, r, reg):
+        """An MMI 3G+ boot image: the startup checksum, then the image inflated
+        (LZO or UCL, as its header says) and the imagefs checksummed. Its stored
+        bytes carry no checksum of their own when the image is compressed."""
+        from .firmware import FirmwareImage
+        startup, stored = struct.unpack_from("<II", reg, 0x20)
+        if not 0 < startup <= stored <= len(reg):
+            r.status, r.used = "BAD", 0
+            r.detail = ("startup size 0x%X / stored size 0x%X do not fit the region"
+                        % (startup, stored))
+            return r
+        r.used = stored
+        if wordsum(reg[:startup]):
+            r.status = "BAD"
+            r.detail = "startup checksum is 0x%08X, must be 0" % wordsum(reg[:startup])
+            return r
+        try:
+            fw = FirmwareImage(r.name, data=reg[:stored])
+        except (ValueError, IndexError, struct.error) as e:
+            r.status, r.detail = "BAD", "startup good, but the image does not inflate: %s" % e
+            return r
+        img = fw.data[fw.base:fw.base + fw.image_size]
+        s = wordsum(img)
+        if len(img) != fw.image_size or s:
+            r.status = "BAD"
+            r.detail = ("startup good; the %s image inflates to %s, but its imagefs "
+                        "checksum is 0x%08X (must be 0)%s"
+                        % (fw.compression, human(len(fw.data)), s,
+                           "" if len(img) == fw.image_size else
+                           ", and %s of it are missing" % human(fw.image_size - len(img))))
+            return r
+        r.status = "OK"
+        r.detail = ("QNX boot image, %s stored (%s) -> %s, startup and imagefs "
+                    "checksums good" % (human(stored), fw.compression, human(len(fw.data))))
+        return r
+
+    def _efs_walk(self, r, reg):
+        """', N files / M dirs walk as a tree' -- or why they don't."""
+        from .efs import EfsImage
+        try:
+            efs = EfsImage(r.name, data=reg)
+            ents = efs.entries()
+        except (ValueError, struct.error, IndexError) as e:
+            return "; it does not open: %s" % e
+        if not efs.structured:
+            return "; its tree does not walk (%s)" % efs.structure_error
+        nf = sum(1 for _p, e in ents if e["_ftype"] == "FILE")
+        nd = sum(1 for _p, e in ents if e["_ftype"] == "DIR")
+        return "; %d files / %d dirs walk as a tree" % (nf, nd)
 
     def check_all(self, progress=None):
         for r in self.regions:
@@ -505,7 +695,7 @@ class NorImage(object):
         from .efs import EfsImage
         reg = self.region_bytes(r)
         label = "%s @0x%07X" % (r.name, r.start)
-        if r.kind == "ifs1":
+        if r.kind in ("ifs1", "ifs"):
             stored = struct.unpack_from("<I", reg, 0x24)[0]
             return FirmwareImage(label, data=reg[:stored or len(reg)])
         if r.kind == "ifs2":
@@ -584,7 +774,7 @@ def compact_matches(labels):
 
 
 def summarise_nor(nor, matches=None):
-    lines = ["PCM 3.1 NOR flash   %s" % human(len(nor.data)),
+    lines = ["%s NOR flash   %s" % (getattr(nor, "product", "PCM 3.1"), human(len(nor.data))),
              "map      %s" % nor.variant,
              "layout   %s" % describe_layout(nor.layout)]
     if nor.chip_paths:
@@ -609,8 +799,10 @@ def summarise_nor(nor, matches=None):
         lines.append("")
         lines.append("BAD: %s" % ", ".join(bad) if bad else
                      "Every region that can check itself is intact.")
-    if any(r.unit for r in nor.regions):
+    own = [r.name for r in nor.regions if r.unit]
+    if own:
         lines.append("")
-        lines.append("HBPERSISTENCE / UPDATEHISTORY belong to this unit -- never "
-                     "replace them with another unit's.")
+        lines.append("%s belong%s to this unit -- never replace %s with another unit's."
+                     % (" / ".join(own), "s" if len(own) == 1 else "",
+                        "it" if len(own) == 1 else "them"))
     return "\n".join(lines)
