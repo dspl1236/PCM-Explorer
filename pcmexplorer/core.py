@@ -157,7 +157,8 @@ class DiskImage:
         self.path = path
         self.size = os.path.getsize(path)
         self.f = open(path, "rb")
-        self.parts = self._read_mbr()
+        self.bare = False        # True: the file is one partition, no table
+        self.parts = self._read_parts()
 
     def __enter__(self):
         return self
@@ -178,6 +179,30 @@ class DiskImage:
         return self.f.read(n)
 
     # -- partitions --
+    def _read_parts(self):
+        """The partition table -- unless the file is a single partition's image.
+
+        A raw copy of one partition (``cat /dev/hd0t187.2`` on a unit, or a
+        partition saved from a disk tool) has no table, but a QNX6 partition's
+        first sector is its boot block, and that ends in 55 AA like an MBR. Read
+        as a table it gives nonsense: on an MMI 3G+ ``persistence`` copy, a
+        103 GB P1 starting 1.9 TB in. So when the file itself has a QNX6
+        superblock where a partition's would be (0x2000, or the tail copy) and
+        the table is empty or points past the end of the file, the whole file is
+        the partition. A real drive's 0x2000 is in the gap before its first
+        partition, and a truncated drive image keeps its table.
+        """
+        parts = self._read_mbr()
+        whole = {"name": "P1", "type": 0, "type_name": "whole file (no partition table)",
+                 "base": 0, "length": self.size, "bootable": False, "logical": False,
+                 "bare": True}
+        fits = parts and all(p["base"] + p["length"] <= self.size
+                             for p in parts if not p["logical"])
+        if not fits and self.superblocks(whole):
+            self.bare = True
+            return [whole]
+        return parts
+
     def _read_mbr(self):
         """Primary partitions, plus any logical ones inside an extended partition.
 
@@ -260,10 +285,23 @@ class DiskImage:
         """Both superblocks (power-safe keeps two), newest serial first.
 
         Which copy is live varies per partition -- do not assume the head one.
+
+        The tail copy sits right after the last data block, at
+        0x3000 + num_blocks * blocksize. That is the partition's last 4 KB only
+        when the partition is a whole number of 8-block groups long; an MMI 3G+
+        partition is not (mkqnx6fs rounds num_blocks down to a multiple of 8, so
+        a few KB are left over), and there the tail copy can be the newer one.
+        Both places are tried.
         """
         base, plen = p["base"], p["length"]
         out = []
-        for cand in (base + 0x2000, base + plen - 0x1000):
+        cands = [base + 0x2000, base + plen - 0x1000]
+        head = self.read(base + 0x2000, 0x200)
+        if len(head) == 0x200 and _u32(head, 0) == QNX6_MAGIC:
+            tail = base + BLKOFF + _u32(head, 0x3c) * _u32(head, 0x30)
+            if base + 0x2000 < tail <= base + plen - 0x1000 and tail not in cands:
+                cands.append(tail)
+        for cand in cands:
             d = self.read(cand, 0x200)
             if len(d) < 0x200 or _u32(d, 0) != QNX6_MAGIC:
                 continue
@@ -423,9 +461,15 @@ class QNX6FS:
         self._cache[b] = data
         return data
 
+    def spare_blocks(self):
+        """Whole blocks of the partition left over after the reserved ones and
+        the data area. mkqnx6fs rounds num_blocks down to a multiple of 8, so
+        this is 0..7: 0 on the PCM 3.1's partitions, 3 on an MMI 3G+'s."""
+        return (self.plen // self.bs) - RESERVED_BLOCKS - self.num_blocks
+
     def geometry_ok(self):
         """True if reserved-block arithmetic agrees with the superblock."""
-        return (self.plen // self.bs) - self.num_blocks == RESERVED_BLOCKS
+        return 0 <= self.spare_blocks() < 8
 
     # -- the block map (drives inodes, files, bitmap and long names alike) --
     def map_block(self, ptrs, levels, n):
@@ -582,7 +626,8 @@ class QNX6FS:
         """Independent consistency checks. Returns [(name, ok, detail)]."""
         res = []
         res.append(("geometry", self.geometry_ok(),
-                    "(plen/bs) - num_blocks == %d" % RESERVED_BLOCKS))
+                    "(plen/bs) - num_blocks = %d reserved + %d spare (0-7 allowed)"
+                    % (RESERVED_BLOCKS, self.spare_blocks())))
 
         want = self.num_inodes - self.free_inodes
         got = len(self.live_inodes())

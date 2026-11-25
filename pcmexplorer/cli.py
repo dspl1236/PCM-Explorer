@@ -941,12 +941,13 @@ def main(argv):
                       "  its partner:  pcm-explorer nor <chipA> <chipB>")
             return 1
         a = argv[2:]
+        dflt = "P1" if img.bare else "P2"      # a single-partition file has only P1
         if cmd == "summary":
             print(summarise_disk(img))
         elif cmd == "parts":
             cmd_parts(img)
         elif cmd == "ls":
-            return cmd_ls(img, a[0] if a else "P2", a[1] if len(a) > 1 else None)
+            return cmd_ls(img, a[0] if a else dflt, a[1] if len(a) > 1 else None)
         elif cmd == "cat":
             if len(a) < 2:
                 print("usage: cat <part> <path>")
@@ -958,9 +959,9 @@ def main(argv):
                 return 1
             return cmd_extract(img, a[0], a[1], a[2])
         elif cmd == "verify":
-            return cmd_verify(img, a[0] if a else "P2")
+            return cmd_verify(img, a[0] if a else dflt)
         elif cmd == "salvage":
-            return cmd_salvage(img, a[0] if a else "P2")
+            return cmd_salvage(img, a[0] if a else dflt)
         elif cmd == "hex":
             off = int(a[0], 0)
             n = int(a[1], 0) if len(a) > 1 else 512

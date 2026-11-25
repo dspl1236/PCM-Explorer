@@ -169,7 +169,10 @@ def summarise_disk(img):
 
     # 40 GB vs 100 GB variant -- decided by whether a media partition exists.
     lines.append("")
-    if jukebox:
+    if getattr(img, "bare", False):
+        lines.append("No partition table: this file is one partition's filesystem")
+        lines.append("(a raw copy of a single partition), opened as P1.")
+    elif jukebox:
         lines.append("Variant: 100 GB type -- has a jukebox (%s media partition)."
                      % human(jukebox["length"]))
         lines.append("         Jukebox is the LAST partition, so it can be grown on a")
