@@ -925,6 +925,186 @@ def test_nor():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _nrv2b_literals(data):
+    """A UCL NRV2B stream of nothing but literals and the end marker -- enough
+    to test the decoder without a compressor."""
+    out, at, n = bytearray(), [0], [0]
+
+    def bit(b):
+        if n[0] == 0:                      # the decoder loads a fresh bit byte here
+            at[0] = len(out)
+            out.append(0)
+        if b:
+            out[at[0]] |= 0x80 >> n[0]
+        n[0] = (n[0] + 1) % 8
+
+    for x in data:
+        bit(1)
+        out.append(x)
+    bit(0)                                 # a match ... whose offset is the end marker
+    bits = bin(0x1000002)[3:]              # (off - 3) * 256 + 0xFF == 0xFFFFFFFF
+    for i, c in enumerate(bits):
+        bit(int(c))
+        bit(1 if i == len(bits) - 1 else 0)
+    out.append(0xFF)
+    return bytes(out)
+
+
+def make_mmi_ifs(ucl):
+    """A tiny MMI 3G+ boot image: startup, then one chunk of a compressed imagefs."""
+    from pcmexplorer import nor
+    startup = bytearray(0x140)
+    startup[0:4] = nor.QNX_STARTUP
+    startup[6] = 0x0D if ucl else 0x09     # flags1: virtual + UCL / LZO
+    startup[0x100:0x110] = b"startup code...."
+    fs = bytearray(0x80)
+    fs[0:7] = b"imagefs"
+    struct.pack_into("<III", fs, 8, len(fs), 0x40, 0x20)  # image, hdr size, dir offset
+    fs = _qnx_fix(fs)
+    comp = _nrv2b_literals(bytes(fs)) if ucl else bytes([17 + len(fs)]) + bytes(fs) + b"\x11\x00\x00"
+    chunk = struct.pack(">H", len(comp)) + comp + b"\x00\x00"
+    struct.pack_into("<II", startup, 0x20, len(startup), len(startup) + len(chunk))
+    return bytes(_qnx_fix(startup)) + chunk
+
+
+def _f3s_dirent(name, first, mode):
+    nm = name.encode() + b"\x00"
+    nm += b"\x00" * ((-len(nm)) % 4)
+    return (struct.pack("<HBBHH", 8, 0, len(name) + 1, first[0], first[1]) + nm
+            + struct.pack("<HHIIII", 20, mode, 0, 0, 1700000000, 1700000000))
+
+
+def make_mmi_efs(name, n_units, boot_phys=0):
+    """An F3S partition of 256 KB units with /mnt/<name>/file.txt; logical unit 1
+    (boot record and all) at physical unit boot_phys, the others spare."""
+    US, HDR = 0x40000, 32
+    part = bytearray(b"\xff" * (US * n_units))
+    for p in range(n_units):
+        b = p * US
+        part[b:b + 4] = b"\x10\x00\x4c\xff"
+        struct.pack_into("<HHIHH", part, b + 4, 18, 0xFFFF, 7, 1, 2)
+        if p == boot_phys:
+            struct.pack_into("<HH", part, b + 0x10, 24, 1)
+        else:
+            part[b + 0x10:b + 0x12] = b"\xff\xff"
+    base, cur = boot_phys * US, [0x28]
+
+    def ext(idx, text, nxt=None):
+        off = cur[0]
+        part[base + off:base + off + len(text)] = text
+        cur[0] = (off + len(text) + 3) & ~3
+        o = base + US - HDR * (idx + 1)
+        part[o:o + 12] = b"\x3c\xfe\xff\xff" * 3
+        struct.pack_into("<HH", part, o + 0x14, off // 4, len(text))
+        struct.pack_into("<II", part, o + 0x18,
+                         0xFFFFFFFF if nxt is None else nxt[0] | (nxt[1] << 16), 0xFFFFFFFF)
+        return (1, idx)
+
+    ext(0, b"u0")
+    ext(1, b"u1")
+    ext(2, struct.pack("<HBB", 24, 3, 0) + b"QSSL_F3S"
+        + struct.pack("<HHHHHH", boot_phys, n_units, 1, 2, 1, 3))
+    data = ext(4, b"payload of " + name.encode())
+    f = ext(5, _f3s_dirent("file.txt", data, 0o100644))
+    ext(3, _f3s_dirent("/mnt/" + name, f, 0o040755))
+    return bytes(part)
+
+
+def make_mmi_nor():
+    """A 128 MB MMI 3G+ /dev/fs0 with tiny self-consistent regions at the real
+    addresses; efs-persist's boot record is NOT in its first unit, as on a car."""
+    from pcmexplorer import nor
+    img = bytearray(b"\xff" * nor.MMI_SIZE)
+    img[0:16] = bytes(range(16))
+    for at in (0x40000, 0x100000):
+        img[at:at + 8] = b".HDG\x10\0\0\0"
+    for at, ucl in ((0x1C0000, True), (0x680000, False)):
+        b = make_mmi_ifs(ucl)
+        img[at:at + len(b)] = b
+    off = nor.MMI_EFS_START
+    for name, n, bp in (("efs-extended", 2, 0), ("efs-system", 3, 0), ("efs-persist", 3, 2)):
+        p = make_mmi_efs(name, n, bp)
+        img[off:off + len(p)] = p
+        off += len(p)
+    img[nor.MMI_TAIL:nor.MMI_TAIL + 16] = b"BIOSCTRL\0\0\1\0\0\0\1\0"
+    return img
+
+
+def test_mmi_nor():
+    print("\nMMI 3G+ NOR flash (/dev/fs0)")
+    from pcmexplorer import nor, ucl
+    from pcmexplorer.firmware import FirmwareImage
+    blob = bytes(range(256)) * 3 + b"tail"
+    check("UCL: a literal stream decodes", ucl.decompress(_nrv2b_literals(blob)) == blob)
+    try:
+        ucl.decompress(_nrv2b_literals(blob)[:-40]); raised = False
+    except ValueError:
+        raised = True
+    check("UCL: a cut stream raises instead of reading past its end", raised)
+    fw = FirmwareImage("emg", data=make_mmi_ifs(True))
+    check("a UCL-built boot image inflates", fw.compression == "UCL"
+          and fw.data[fw.base:fw.base + 7] == b"imagefs", fw.compression)
+
+    img = make_mmi_nor()
+    tmp = tempfile.mkdtemp(prefix="pcmx_mmi")
+    try:
+        pm = os.path.join(tmp, "fs0.bin")
+        with open(pm, "wb") as f:
+            f.write(img)
+        check("looks_like_nor() accepts a 128 MB MMI 3G+ dump", nor.looks_like_nor(pm))
+        n = nor.NorImage(pm)
+        names = [r.name for r in n.regions]
+        check("MMI map: regions in flash order", names == [
+            "IPL", "FPGA", "FPGA-EMG", "IFS-EMG", "IFS-ROOT", "EFS-EXTENDED",
+            "EFS-SYSTEM", "EFS-PERSIST", "SPARE", "TAIL"], str(names))
+        r = n.region("EFS-PERSIST")
+        check("efs-persist found from its boot record, not its first unit",
+              r.start == nor.MMI_EFS_START + 5 * 0x40000 and r.size == 3 * 0x40000,
+              "0x%X +0x%X" % (r.start, r.size))
+        st = {r.name: n.check(r).status for r in n.regions}
+        check("clean MMI dump: every region as expected", st == {
+            "IPL": "UNVERIFIED", "FPGA": "UNVERIFIED", "FPGA-EMG": "UNVERIFIED",
+            "IFS-EMG": "OK", "IFS-ROOT": "OK", "EFS-EXTENDED": "UNVERIFIED",
+            "EFS-SYSTEM": "UNVERIFIED", "EFS-PERSIST": "UNVERIFIED",
+            "SPARE": "ERASED", "TAIL": "UNVERIFIED"}, str(st))
+        check("IFS-EMG reports UCL", "(UCL)" in n.region("IFS-EMG").detail,
+              n.region("IFS-EMG").detail)
+        check("the EFS trees walk", "walk as a tree" in n.region("EFS-PERSIST").detail,
+              n.region("EFS-PERSIST").detail)
+        efs = n.open_region(n.region("EFS-PERSIST"))
+        check("efs-persist browses: its file reads back",
+              efs.read_file("/mnt/efs-persist/file.txt") == b"payload of efs-persist")
+        check("persistence and the tail are unit data",
+              n.region("EFS-PERSIST").unit and n.region("TAIL").unit
+              and not n.region("EFS-SYSTEM").unit)
+        bad = bytearray(img)
+        bad[0x680000 + 0x140 + 2 + 1 + 0x30] ^= 0x01          # a literal of the imagefs
+        nb = nor.NorImage("x", data=bytes(bad))
+        rb = nb.check(nb.region("IFS-ROOT"))
+        check("a flipped bit inside IFS-ROOT fails the imagefs checksum",
+              rb.status == "BAD" and "imagefs" in rb.detail, rb.detail)
+        bad = bytearray(img)
+        bad[0x1C0000 + 0x104] ^= 0x01                          # startup code
+        nb = nor.NorImage("x", data=bytes(bad))
+        rb = nb.check(nb.region("IFS-EMG"))
+        check("a flipped bit in the startup fails its checksum",
+              rb.status == "BAD" and "startup checksum" in rb.detail, rb.detail)
+        s = nor.summarise_nor(n)
+        check("summary names the product", s.startswith("Audi MMI 3G+ NOR flash"), s[:40])
+
+        import contextlib
+        import io
+        from pcmexplorer.cli import main as cli_main
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli_main([pm])
+        check("cli: an MMI dump is recognised and checked",
+              rc == 0 and "IFS-ROOT" in out.getvalue() and "intact" in out.getvalue(),
+              "rc %s" % rc)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_version():
     print("\nversion reporting")
     import pcmexplorer
@@ -973,6 +1153,7 @@ def main():
     test_timeline()
     test_svg()
     test_nor()
+    test_mmi_nor()
     test_version()
     test_real_image_if_present()
     print("\n%s" % ("ALL PASSED" if not _fails
