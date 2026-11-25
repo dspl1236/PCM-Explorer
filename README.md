@@ -248,6 +248,7 @@ UI, **Open NOR chips...** takes both chip files (or **Open image...** takes a me
   times and split them across erase units, and they still come out whole.
 - A PCM-Forge **Flash Backup** (`pcm_flash.bin`, copied over USB with no programmer) is
   one merged 64 MB image and opens the same way.
+- An **Audi MMI 3G+** `/dev/fs0` (128 MB) opens too; see [MMI 3G+ flash dumps](#mmi-3g-flash-dumps).
 
 The same from the command line, on a merged dump or straight from the two chips:
 
@@ -367,8 +368,30 @@ where the filesystem ends, and on `persistence` it was the newer, live copy.
 
 MMI **firmware** is confirmed working against a real image: the `ifs-root.ifs` from an
 MMI 3G+ package (`8R0906961ES`, variant MU9411) opens and enumerates correctly — 43.7 MB
-compressed, 99.4 MB inflated, 345 files. A real MMI *drive* image is still untested; if
-you have one, an issue saying whether it worked would be genuinely useful.
+compressed, 99.4 MB inflated, 345 files. The emergency image `ifs-emg.ifs` is built with
+UCL instead of LZO, and opens too. A real MMI *drive* image is still untested; if you
+have one, an issue saying whether it worked would be genuinely useful.
+
+### MMI 3G+ flash dumps
+
+A 128 MB `/dev/fs0` read off a running MMI 3G+ (for example `cat /dev/fs0` piped over the
+network, or to an SD card) opens like a PCM NOR dump: `python explorer.py fs0.bin check`,
+or **Open image...** in the desktop UI. Checked against a real K0942_3 unit:
+
+| Region | Address | Check |
+|--------|---------|-------|
+| IPL | `0x0000000` | none known |
+| FPGA, FPGA-EMG | `0x0040000`, `0x0100000` | none known |
+| IFS-EMG | `0x01C0000` | startup checksum, then inflated (UCL) and the imagefs checksummed |
+| IFS-ROOT | `0x0680000` | the same, LZO |
+| EFS-EXTENDED, EFS-SYSTEM, EFS-PERSIST | from `0x3100000` | walked as F3S trees, browsable |
+| TAIL | `0x7F00000` | none known; no update image covers it |
+
+The three flash filesystems are found from their own boot records, the way the unit's
+flash driver finds them, and named by the mount path their root carries. On a car the
+persistence partition's boot record has moved away from its first unit, so a fixed
+table would get it wrong. EFS-PERSIST and TAIL are that unit's own data (coding, keys,
+settings): never put them on another unit.
 
 ## Contributing
 
