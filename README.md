@@ -102,7 +102,7 @@ That's the right question to ask of a recovery tool, so it ships with a `verify`
 that checks the reader against the filesystem's own bookkeeping:
 
 ```
-[PASS] geometry             (plen/bs) - num_blocks == 16
+[PASS] geometry             (plen/bs) - num_blocks = 16 reserved + 0 spare (0-7 allowed)
 [PASS] inode census         376 live, superblock says 376
 [PASS] block bitmap         546413 clear, superblock says 546413 free
 [PASS] directory identity   20 directories checked, 0 inconsistent
@@ -355,6 +355,15 @@ four primary entries would miss most of the disk, including `persistence`.
 That layout is derived from [DrGER's MMI3G-HDD-Prep-Tool](https://github.com/DrGER2/MMI3G-HDD-Prep-Tool),
 which formats these drives. The extended-partition handling is verified against a
 synthetic disk built to that layout.
+
+A raw copy of **one partition** opens too, for example `cat /dev/hd0t187.2` from a running
+MMI 3G+ (its `persistence` partition): with no partition table, the whole file is opened
+as `P1`. A QNX6 partition's first sector ends in `55 AA` like a partition table, so the
+file is only read as a partition when it carries a QNX6 superblock of its own and its
+"table" doesn't fit inside it. Checked on the `persistence` and `mmebackup1` partitions of
+a real MMI 3G+ drive: both pass `verify`. MMI partitions leave a few spare blocks after
+the filesystem, so the second superblock is not in the partition's last 4 KB; it is found
+where the filesystem ends, and on `persistence` it was the newer, live copy.
 
 MMI **firmware** is confirmed working against a real image: the `ifs-root.ifs` from an
 MMI 3G+ package (`8R0906961ES`, variant MU9411) opens and enumerates correctly — 43.7 MB

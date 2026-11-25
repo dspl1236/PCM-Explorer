@@ -34,6 +34,11 @@ Sanity check available at mount time, true on both partitions:
 (partition_length / blocksize) - num_blocks == 16      # 12 front + 4 tail superblock
 ```
 
+That holds on the PCM 3.1 drive, whose partitions are a whole number of 8-block groups.
+`mkqnx6fs` rounds `num_blocks` down to a multiple of 8, so on a partition that isn't (every
+one checked on an Audi MMI 3G+ drive) a few blocks are left over after the tail
+superblock: 16 + 3 there. So the general rule is 16 + 0..7.
+
 ## Partition layout
 
 | part | type | start LBA | size | filesystem | contents |
@@ -47,7 +52,12 @@ Sanity check available at mount time, true on both partitions:
 Magic `0x68191122` little-endian. The power-safe filesystem keeps **two** copies:
 
 - `base + 0x2000` (front)
-- `base + length - 0x1000` (tail)
+- `base + 0x3000 + num_blocks * blocksize` (tail): right after the last data block
+
+On the PCM drive the tail copy is also the partition's last 4 KB (`base + length -
+0x1000`), which is where an earlier version of this tool looked. On a partition with spare
+blocks after it (see the geometry note above) it is not, and an MMI 3G+ `persistence`
+partition was a case where the tail copy was the live one (serial 6 against the front's 5).
 
 **Always pick the one with the higher `u64` serial at `+0x08`.** Which copy is live is not
 consistent — on the measured drive P1's live copy is the front one and P2's is the tail
@@ -180,7 +190,8 @@ Symlinks (`mode & 0xF000 == 0xA000`) store their target as file contents, e.g.
 Four checks, each catching a different class of error. PCM Explorer ships them as
 `verify` and all four pass on both partitions:
 
-1. **Geometry** — `(plen / bs) - num_blocks == 16`. Catches a wrong block origin instantly.
+1. **Geometry** — `(plen / bs) - num_blocks` is 16, plus 0-7 spare blocks. Catches a
+   wrong block origin instantly.
 2. **Inode census** — count `status in (1,3)` over `1..num_inodes`; must equal
    `num_inodes - free_inodes`.
 3. **Block bitmap popcount** — count clear bits in the bitmap (reached through a

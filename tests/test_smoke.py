@@ -127,6 +127,88 @@ def test_no_mbr():
         os.remove(path)
 
 
+def _qnx6_sb(serial, bs, num_blocks):
+    sb = bytearray(0x200)
+    struct.pack_into("<IIQ", sb, 0, QNX6_MAGIC, 0, serial)
+    struct.pack_into("<IIIIII", sb, 0x30, bs, 16, 0, num_blocks, num_blocks, 1)
+    return bytes(sb)
+
+
+def make_bare_qnx6(path, spare=3, tail_serial=6):
+    """One QNX6 partition's raw image, no table, shaped like an MMI 3G+
+    ``persistence`` copy: the boot block ends in 55 AA and its "entries" point far
+    past the end of the file; the length is not a whole number of 8-block groups,
+    so the tail superblock is NOT in the last 4 KB; and that tail copy is newer."""
+    bs, nb = 1024, 256
+    size = BLKOFF + nb * bs + 4 * bs + spare * bs + 512     # odd tail, as on the unit
+    img = bytearray(size)
+    img[446:462] = _entry(0, 114, 0xE8000000, 0xCEC00000)   # nonsense, as seen
+    img[462:478] = _entry(0, 6, 0xC4000000, 0x01FBE000)
+    img[510:512] = b"\x55\xaa"
+    img[0x2000:0x2200] = _qnx6_sb(5, bs, nb)
+    tail = BLKOFF + nb * bs
+    img[tail:tail + 0x200] = _qnx6_sb(tail_serial, bs, nb)
+    with open(path, "wb") as f:
+        f.write(img)
+    return tail
+
+
+def test_bare_partition():
+    print("\na raw image of one QNX6 partition (no partition table)")
+    from pcmexplorer.core import QNX6FS
+    from pcmexplorer.decode import summarise_disk
+    tmp = tempfile.mkdtemp(prefix="pcmx_bare")
+    try:
+        path = os.path.join(tmp, "hd0t187.2.bin")
+        tail = make_bare_qnx6(path)
+        with DiskImage(path) as img:
+            check("recognised as one partition, not as a disk", img.bare
+                  and [(p["name"], p["base"], p["length"]) for p in img.parts]
+                  == [("P1", 0, img.size)], str([(p["name"], p["base"]) for p in img.parts]))
+            sbs = img.superblocks(img.parts[0])
+            check("the tail superblock is found where the data area ends",
+                  [s["off"] for s in sbs] == [tail, 0x2000], str([hex(s["off"]) for s in sbs]))
+            check("...and the newer copy is the live one", sbs[0]["serial"] == 6)
+            fs = QNX6FS(img, img.parts[0])
+            check("geometry allows the 0-7 spare blocks mkqnx6fs leaves",
+                  fs.spare_blocks() == 3 and fs.geometry_ok(), str(fs.spare_blocks()))
+            s = summarise_disk(img)
+            check("the summary says so, with no drive-variant verdict",
+                  "No partition table" in s and "Variant" not in s, s)
+        path2 = os.path.join(tmp, "spare8.bin")
+        make_bare_qnx6(path2, spare=8)
+        with DiskImage(path2) as img:
+            check("8 spare blocks fail the geometry check",
+                  not QNX6FS(img, img.parts[0]).geometry_ok())
+        # A real table that fits keeps its partitions, even with a superblock at 0x2000
+        path3 = os.path.join(tmp, "disk.img")
+        make_mmi_image(path3)
+        with open(path3, "r+b") as f:
+            f.seek(0x2000)
+            f.write(_qnx6_sb(1, 1024, 16))
+        with DiskImage(path3) as img:
+            check("a disk whose table fits is still read as a disk",
+                  not img.bare and len(img.parts) == 9, str(len(img.parts)))
+        # A truncated disk (entries past the end) with nothing at 0x2000 keeps its table
+        path4 = os.path.join(tmp, "short.img")
+        make_mmi_image(path4)
+        with open(path4, "r+b") as f:
+            f.truncate(CYL * SEC * 3)
+        with DiskImage(path4) as img:
+            check("a truncated disk keeps its table", not img.bare and img.parts)
+        # the CLI lists P1 by default
+        import contextlib
+        import io
+        from pcmexplorer.cli import main as cli_main
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli_main([path])
+        check("cli: no 40 GB / 100 GB verdict for a partition image",
+              "No partition table" in out.getvalue() and "jukebox" not in out.getvalue())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_helpers():
     print("\nhelpers")
     check("human()", human(0) == "0 B" and human(1536) == "1.5 KB"
@@ -957,6 +1039,7 @@ def main():
     print("PCM Explorer smoke tests")
     test_partitions()
     test_no_mbr()
+    test_bare_partition()
     test_helpers()
     test_rootnode()
     test_decoders()
